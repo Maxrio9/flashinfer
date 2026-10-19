@@ -195,6 +195,11 @@ def _query(
     invocation: FrozenMapping,
 ) -> MoeDecodeQuery:
     plan = experts.plan._impl
+    numerical_recipe = invocation.get("numerical_recipe", plan.numerical_recipe)
+    if numerical_recipe != plan.numerical_recipe:
+        raise ValueError(
+            "execution numerical_recipe must match the prepared weight plan"
+        )
     quant_modes = tuple(sorted(plan.quant_modes))
     quant_mode = quant_modes[0] if len(quant_modes) == 1 else "multi"
     cutoff = experts.plan.activation.a16_max_tokens
@@ -247,10 +252,11 @@ def _query(
         w4a16_scale_format=plan.w4a16_scale_format,
         w4a16_block_size_m=invocation.get("w4a16_block_size_m"),
         fast_math=bool(invocation.get("fast_math", True)),
-        numerical_recipe=invocation.get("numerical_recipe"),
+        numerical_recipe=numerical_recipe,
         controls=controls,
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
         csf_inline_scales=plan.csf_inline_scales,
+        output_layout=routing.output_layout,
     )
 
 
@@ -280,6 +286,13 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         if plan.trellis_pair_kinds is None
         else tuple(plan.trellis_pair_kinds),
         "intermediate_hadamard_blocks": plan.intermediate_hadamard_blocks,
+        # Keep stock compiler payload/cache identities unchanged. Explicit
+        # recipes must also survive the compiler-process weight-plan rebuild.
+        **(
+            {"numerical_recipe": plan.numerical_recipe}
+            if plan.numerical_recipe is not None
+            else {}
+        ),
     }
 
 
@@ -317,6 +330,9 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
+    if query.output_layout == "token_and_routes":
+        TUNING.validate_query(query, None)
+        TUNING.validate_config(query, config, None)
     mode = query.quant_mode
     if mode == "multi":
         if config.backend == "w4a16":
@@ -345,6 +361,7 @@ def _lower_caps(
         apply_router_weight_on_input=query.apply_router_weight_on_input,
         collect_activation_amax=query.collect_activation_amax,
         deterministic_output=query.deterministic_output,
+        numerical_recipe=query.numerical_recipe,
         swiglu_limit=_decode_scalar(query.swiglu_limit),
         swiglu_clamp_after_silu=query.swiglu_clamp_after_silu,
         swiglu_alpha=_decode_scalar(query.swiglu_alpha),
@@ -858,6 +875,12 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             _impl._DYNAMIC_W4A8_SHARE_INPUT_ENV,
             default=dense or decode,
         )
+    if plan.numerical_recipe is not None:
+        # An explicit numerical boundary fixes this lowering independently of
+        # optional throughput controls. Validation rejects other route modes.
+        if direct_routing or external_route_plan:
+            raise ValueError("weighted MXFP8 cannot use direct or external routes")
+        share_input = True
     return {
         "n": n,
         "w4a8_repacked": prepared_w4a8,
@@ -1049,6 +1072,7 @@ def _program_carriers(
                 external_route_plan=dynamic["external_route_plan"],
                 share_input_across_experts=dynamic["share_input_across_experts"],
                 deterministic_output=plan.deterministic_output,
+                numerical_recipe=plan.numerical_recipe,
                 swiglu_limit=plan.swiglu_limit,
                 swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
                 swiglu_alpha=plan.swiglu_alpha,
@@ -1160,6 +1184,7 @@ class _FusedMoeState:
     w4a16_launches: _W4A16PrimaryLaunches | None = None
     compact_launches: _CompactLaunches | None = None
     execution_experts: object | None = None
+    output_layout: str = "token_sum"
 
     def _a4_launch_for(
         self,
@@ -1230,9 +1255,27 @@ class _FusedMoeState:
         )
         if self.w4a16_launches is not None:
             kwargs["_w4a16_launches"] = self.w4a16_launches
-        return replace(
+        binding = replace(
             self.scratch.bind(**kwargs), compact_launches=self.compact_launches
         )
+        if self.output_layout == "token_and_routes":
+            rows = binding.route_output
+            tokens, hidden = binding.a.shape
+            if (
+                binding.implementation != "dynamic"
+                or binding.deterministic_output is not True
+                or not isinstance(rows, torch.Tensor)
+                or rows.dtype != torch.bfloat16
+                or rows.device != binding.a.device
+                or rows.ndim != 2
+                or rows.shape[1] != hidden
+                or rows.shape[0] < tokens * binding.topk_ids.shape[1]
+                or not rows.is_contiguous()
+            ):
+                raise ValueError(
+                    "token_and_routes binding lacks weighted BF16 original route rows"
+                )
+        return binding
 
     def run(self, binding):
         return binding.run()
@@ -1429,6 +1472,7 @@ def plan(
                         "apply_router_weight_on_input": query.apply_router_weight_on_input,
                         "collect_activation_amax": query.collect_activation_amax,
                         "deterministic_output": query.deterministic_output,
+                        "output_layout": query.output_layout,
                     }
                 ),
                 "controls": controls,
@@ -1499,6 +1543,13 @@ def plan(
                 _mixed_trellis_launches=programs.mixed_trellis_launches,
                 _prewarmed_route_pack_launches=programs.route_pack_launches,
             )
+            if (
+                query.output_layout == "token_and_routes"
+                and scratch.launch_plan.implementation != "dynamic"
+            ):
+                raise RuntimeError(
+                    "selected tactic cannot retain original MoE route rows"
+                )
             launchers = list(programs.launchers)
             scale_decoder = None
             if expansion is not None:
@@ -1533,6 +1584,7 @@ def plan(
                 replace(experts._impl, nvfp4_csf=scale_decoder)
                 if scale_decoder is not None
                 else experts._impl,
+                output_layout=query.output_layout,
             )
 
         return Plan(

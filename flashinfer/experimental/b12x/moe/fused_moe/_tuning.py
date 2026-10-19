@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
+from b12x.moe._shared.numerics import (
+    BF16_FC1_WEIGHTED_MXFP8,
+    validate_numerical_recipe,
+)
 
 from dataclasses import dataclass, replace
 
@@ -51,6 +55,7 @@ class MoeDecodeQuery:
     shared_input_scales: bool = False
     csf_inline_scales: bool = False
     swiglu_clamp_after_silu: bool = False
+    output_layout: str = "token_sum"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -61,6 +66,7 @@ class MoeDecodeQuery:
             "shared_input_scales": self.shared_input_scales,
             "csf_inline_scales": self.csf_inline_scales,
             "deterministic_output": self.deterministic_output,
+            "output_layout": self.output_layout,
             "hidden_size": self.hidden_size,
             "intermediate_size": self.intermediate_size,
             "io_dtype": self.io_dtype,
@@ -275,6 +281,12 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("query must be MoeDecodeQuery")
     if not isinstance(query.controls, FrozenMapping):
         raise TypeError("MoE controls must be frozen declaration metadata")
+    if query.output_layout not in ("token_sum", "token_and_routes"):
+        raise ValueError("MoE output_layout must be token_sum or token_and_routes")
+    if query.output_layout == "token_and_routes" and (
+        query.deterministic_output is not True or query.io_dtype != "bfloat16"
+    ):
+        raise ValueError("token_and_routes requires deterministic BF16 output")
     if query.controls.get("trellis_decode_table", "auto") not in {
         "auto",
         "compact",
@@ -289,6 +301,7 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         query.numerical_recipe, str
     ):
         raise TypeError("MoE numerical_recipe must be a string or null")
+    validate_numerical_recipe(query.numerical_recipe)
     if type(query.shared_input_scales) is not bool:
         raise TypeError("shared_input_scales must be boolean")
     if type(query.csf_inline_scales) is not bool:
@@ -383,13 +396,63 @@ def _nvfp4_materialization_eligible(query, config):
     )
 
 
+def _masked_physical_bank_query(query):
+    # The route selector still owns its actual global expert domain. Only
+    # storage/compute is a physically smaller bank; top-k is never shrunk,
+    # padded with fake experts, or renormalized for that bank.
+    return bool(
+        query.numerical_recipe == BF16_FC1_WEIGHTED_MXFP8
+        and query.route_num_experts is not None
+        and query.route_num_experts >= query.top_k
+        and 0 < query.top_k <= 8
+    )
+
+
 def validate_moe_decode_config(
     query: MoeDecodeQuery,
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
     """Reject a decode config the query's recipe cannot execute."""
+    if query.output_layout == "token_and_routes":
+        if query.deterministic_output is not True or query.io_dtype != "bfloat16":
+            raise ValueError("token_and_routes requires deterministic BF16 output")
+        if config.backend != "dynamic":
+            raise ValueError(
+                "token_and_routes requires a tactic retaining original route rows"
+            )
     _validate_block_moe_launch(query, config)
+    validate_numerical_recipe(query.numerical_recipe)
+    if query.numerical_recipe is not None:
+        if not (
+            query.quant_mode == "w4a8_mx"
+            and query.source_format == "fp4_e8m0_k32"
+            and query.io_dtype == "bfloat16"
+            and query.activation == "silu"
+            and query.swiglu_limit == 10.0
+            and query.swiglu_alpha in (None, 1.0)
+            and query.swiglu_beta in (None, 0.0)
+            and not query.apply_router_weight_on_input
+            and not query.collect_activation_amax
+            and query.deterministic_output is True
+            and query.fast_math
+            and 0 < query.top_k <= 8
+            and (query.top_k <= query.num_experts or _masked_physical_bank_query(query))
+            and query.hidden_size % 256 == 0
+            and query.intermediate_size % 128 == 0
+            and config.backend == "dynamic"
+            and config.route_planner == "internal"
+            and config.dynamic_route_mode == "grouped"
+            and config.dynamic_tile_m in (64, 128)
+            and query.controls.get("dynamic_work_source", "materialized_queue")
+            != "ready_queue"
+            and (_device is None or _device.compute_capability == (12, 0))
+        ):
+            raise ValueError(
+                "weighted MXFP8 numerical_recipe requires SM120 BF16 plain MXFP4, "
+                "SiLU/clamp10, FP32 route weights after FC1, "
+                "fast math, deterministic grouped materialized M64/M128 execution"
+            )
     if query.source_format in BLOCK_CODECS:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
             raise ValueError("IQ2_XS requires BF16 W4A16 execution")
@@ -649,6 +712,18 @@ def _default_config(
 ) -> MoeDecodeConfig:
     from ._impl import _heuristic_moe_decode_config
 
+    validate_numerical_recipe(query.numerical_recipe)
+    if query.numerical_recipe is not None:
+        config = MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_tile_m=128,
+            dynamic_route_mode="grouped",
+        )
+        validate_moe_decode_config(query, config, device)
+        return config
+
     if query.quant_mode == "multi":
         non_a16 = tuple(mode for mode in query.quant_modes if mode != "w4a16")
         if len(non_a16) != 1:
@@ -704,7 +779,7 @@ def _materialize_tuning(query, device, choice):
             query.num_tokens,
         )
         <= 0
-        or query.top_k > query.num_experts
+        or (query.top_k > query.num_experts and not _masked_physical_bank_query(query))
         or query.routed_rows != query.num_tokens * query.top_k
     ):
         raise ValueError("MoE tuning requires consistent concrete routing geometry")
@@ -927,7 +1002,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=31,
+    query_schema_version=32,
     config_schema_version=26,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
@@ -937,7 +1012,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=34,
+    candidate_contract_version=35,
     knobs=(
         Knob(
             name="backend",

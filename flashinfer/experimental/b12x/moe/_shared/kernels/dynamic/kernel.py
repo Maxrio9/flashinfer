@@ -18,6 +18,7 @@ from cutlass.cutlass_dsl import Uint32
 from cutlass.cutlass_dsl import Uint64
 from cutlass.cutlass_dsl import Uint8
 from b12x.moe._shared.kernels.w4a8_phase1 import W4A8MaterializedPhase1Kernel
+from b12x.moe._shared.kernels.w4a8_phase1 import quantize_block_fp8_cake
 from b12x.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
 from b12x._lib.dense_gemm.config import _expand_packed_b_stage_smem
 from b12x._lib.dense_gemm.config import _reshape_acc_to_mn
@@ -161,11 +162,42 @@ class MoEDynamicKernelBackend:
         trellis_bits: int | None = None,
         trellis_intermediate_hadamard: bool = False,
         trellis_direct_lut: bool = False,
+        numerical_recipe: str | None = None,
     ):
         """Record the dynamic-kernel specialization and reject unsupported recipe
         combinations.
         """
         activation = normalize_moe_activation(activation)
+        from b12x.moe._shared.numerics import (
+            BF16_FC1_WEIGHTED_MXFP8,
+            validate_numerical_recipe,
+        )
+
+        self.numerical_recipe = validate_numerical_recipe(numerical_recipe)
+        if self.numerical_recipe == BF16_FC1_WEIGHTED_MXFP8 and not (
+            quant_recipe == "w4a8_mx"
+            and w4a8_repacked
+            and materialize_intermediate
+            and share_input_across_experts
+            and deterministic_output
+            and activation == "silu"
+            and swiglu_limit == 10.0
+            and not direct_routing
+            and not external_route_plan
+            and not trellis_bits
+            and work_source != _WORK_SOURCE_READY_QUEUE
+            and mma_tiler_mn in ((64, 128), (128, 128))
+            and not w4a8_n64_repacked
+            and not w4a8_n64_tail
+            and not swap_ab
+            and not separate_w13_halves
+            and fast_math
+            and swiglu_alpha in (None, 1.0)
+            and swiglu_beta in (None, 0.0)
+        ):
+            raise ValueError(
+                "weighted MXFP8 requires deterministic grouped materialized W4A8 MX"
+            )
         if quant_recipe not in {
             "nvfp4",
             "w4a8_mx",
@@ -443,6 +475,7 @@ class MoEDynamicKernelBackend:
             )
         else:
             self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
+                numerical_recipe=self.numerical_recipe,
                 fast_math=self.fast_math,
                 swiglu_limit=swiglu_limit,
                 source_tile_m=materialized_source_tile_m,
@@ -471,6 +504,7 @@ class MoEDynamicKernelBackend:
                 ),
             )
             self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
+                numerical_recipe=self.numerical_recipe,
                 source_tile_m=materialized_source_tile_m,
                 deterministic_output=bool(deterministic_output),
                 n64_repacked=self.w4a8_n64_repacked,
@@ -1186,6 +1220,11 @@ class MoEDynamicKernelBackend:
 
     @cute.jit
     def _quantize_mx(self, values: cute.Tensor, max_abs: cutlass.Float32):
+        if cutlass.const_expr(self.numerical_recipe is not None):
+            # Cake MegaMoE's source-input packing, also used for the FC1
+            # intermediate: zero and tiny blocks keep scale byte 105, where
+            # stock MX quantization emits scale zero and has no floor.
+            return quantize_block_fp8_cake(values, max_abs)
         return quantize_block_fp8_mx(values, max_abs)
 
     @cute.jit
@@ -2873,6 +2912,28 @@ class MoEDynamicKernelBackend:
             while j < scatter_total_u32:
                 scatter_output_u32[j // cols_u32, j % cols_u32] = Uint32(0)
                 j += flat_stride
+
+        if cutlass.const_expr(self.numerical_recipe is not None):
+            # A physical bank has no FC2 producer for inactive token/slot
+            # routes. Clear only those rows before the resident-grid barrier;
+            # active rows keep the split kernel's write-once output contract.
+            # This recipe admits K aligned to 256, so every row has complete
+            # 16-byte vectors and needs no scalar tail.
+            vectors_per_route = cols_u32 // Int32(4)
+            route_vecs = total_pairs * vectors_per_route
+            zv = flat_tid
+            while zv < route_vecs:
+                route = zv // vectors_per_route
+                local_expert = topk_ids[route].to(Int32)
+                if local_expert < Int32(0) or local_expert >= num_experts:
+                    st_global_v4_u32(
+                        scatter_base + Int64(zv) * Int64(16),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                    )
+                zv += flat_stride
 
         # Materialized slots are overwritten before the second grid barrier;
         # only a true ready queue needs generation flags cleared up front.

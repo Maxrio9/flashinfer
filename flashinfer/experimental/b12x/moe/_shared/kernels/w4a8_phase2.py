@@ -15,6 +15,10 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
+from b12x.moe._shared.numerics import (
+    BF16_FC1_WEIGHTED_MXFP8,
+    validate_numerical_recipe,
+)
 
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
@@ -75,7 +79,21 @@ class W4A8MaterializedPhase2Kernel:
         n64_tail: bool = False,
         direct_routes: bool = False,
         fused_topk: int = 0,
+        numerical_recipe: str | None = None,
     ):
+        self.numerical_recipe = validate_numerical_recipe(numerical_recipe)
+        self.weighted_mxfp8 = self.numerical_recipe == BF16_FC1_WEIGHTED_MXFP8
+        if self.weighted_mxfp8 and not (
+            deterministic_output
+            and trellis_bits is None
+            and not direct_routes
+            and source_tile_m in (64, 128)
+            and not n64_repacked
+            and not n64_tail
+        ):
+            raise ValueError(
+                "weighted MXFP8 phase 2 requires deterministic plain grouped M64/M128"
+            )
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
         self.direct_routes = bool(direct_routes)
@@ -783,7 +801,10 @@ class W4A8MaterializedPhase2Kernel:
                         if cutlass.const_expr(self.direct_routes)
                         else token_map[physical_row].to(Int32)
                     )
-                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
+                    scale = down_scale
+                    if cutlass.const_expr(not self.weighted_mxfp8):
+                        # The weighted recipe applied the route weight before FC2 quantization.
+                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.fused_topk > 0):
                         local_col = (
                             warp_idx * Int32(self.tile_n // 4)
@@ -825,7 +846,9 @@ class W4A8MaterializedPhase2Kernel:
                         if cutlass.const_expr(self.direct_routes)
                         else token_map[physical_row].to(Int32)
                     )
-                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
+                    scale = down_scale
+                    if cutlass.const_expr(not self.weighted_mxfp8):
+                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         st_global_u32(
                             get_ptr_as_int64(

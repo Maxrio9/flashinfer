@@ -116,7 +116,9 @@ def prepare_csf_block_weights(plan, weights):
             for s in source_outputs
         )
     elif not nvfp4:
-        table = torch.arange(256, device=device).clamp_max_(247).to(torch.uint8)
+        table = torch.arange(256, dtype=torch.uint8, device=device)
+        if plan.numerical_recipe is None:
+            table.clamp_max_(247)
         tables = (table, table)
     prepared = prepare_weights(plan=plan, weights=native_weights)
     rep = prepared._impl.representation

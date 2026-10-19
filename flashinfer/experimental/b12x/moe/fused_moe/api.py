@@ -106,6 +106,7 @@ def _canonical_plan_weights(
     activation: ActivationSpec,
     geometry: MoEGeometry,
     constraints: WeightPlanConstraints | None = None,
+    numerical_recipe: str | None = None,
 ) -> WeightPlan:
     """Declare canonical checkpoint representation and preparation only."""
     return _plan_weights(
@@ -113,6 +114,7 @@ def _canonical_plan_weights(
         activation=activation,
         geometry=geometry,
         constraints=constraints,
+        numerical_recipe=numerical_recipe,
     )
 
 

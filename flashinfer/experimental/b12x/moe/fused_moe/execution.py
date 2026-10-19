@@ -36,7 +36,13 @@ class ExecutionCapacity:
 
 @dataclass(frozen=True, kw_only=True)
 class RoutingSpec:
-    """Immutable routing and numerical controls captured by preparation."""
+    """Immutable routing, numerical controls, and retained output layout.
+
+    ``token_sum`` retains the ordinary reduced token output. ``token_and_routes``
+    also retains weighted BF16 rows in original token/top-k slot order through
+    ``Binding.route_output``. Retained routes require deterministic reduction;
+    omitted determinism becomes true and an explicit false is rejected.
+    """
 
     apply_router_weight_on_input: bool = False
     logits_dtype: torch.dtype | None = None
@@ -48,6 +54,18 @@ class RoutingSpec:
     has_image_correction_bias: bool = False
     has_image_mask: bool = False
     routed_scaling_factor: float = 1.0
+    output_layout: str = "token_sum"
+
+    def __post_init__(self):
+        if self.output_layout not in ("token_sum", "token_and_routes"):
+            raise ValueError("MoE output_layout must be token_sum or token_and_routes")
+        if self.output_layout == "token_and_routes":
+            if (
+                self.deterministic_output is not None
+                and self.deterministic_output is not True
+            ):
+                raise ValueError("token_and_routes requires deterministic_output=True")
+            object.__setattr__(self, "deterministic_output", True)
 
 
 def plan_execution(

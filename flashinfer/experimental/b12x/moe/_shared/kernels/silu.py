@@ -98,6 +98,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
         csf_inline_scales: bool = False,
+        numerical_recipe: str | None = None,
     ):
         super().__init__(
             sf_vec_size,
@@ -128,6 +129,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
             csf_inline_scales=csf_inline_scales,
+            numerical_recipe=numerical_recipe,
         )
 
 

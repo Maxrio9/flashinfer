@@ -312,8 +312,12 @@ class MoEWeightPreparationPlan:
     trellis_pair_kinds: frozenset[str] | None = None
     intermediate_hadamard_blocks: tuple[int, int] | None = None
     csf_inline_scales: bool = False
+    numerical_recipe: str | None = None
 
     def __post_init__(self) -> None:
+        from .numerics import validate_numerical_recipe
+
+        validate_numerical_recipe(self.numerical_recipe)
         specs = tuple(self.specs)
         if not specs:
             raise ValueError("weight preparation requires at least one MoE spec")
@@ -321,6 +325,17 @@ class MoEWeightPreparationPlan:
         object.__setattr__(self, "num_experts", int(self.num_experts))
         object.__setattr__(self, "hidden_size", int(self.hidden_size))
         object.__setattr__(self, "intermediate_size", int(self.intermediate_size))
+        if self.numerical_recipe is not None and (
+            self.quant_modes != frozenset({"w4a8_mx"})
+            or self.source_format != "fp4_e8m0_k32"
+            or self.activation != "silu"
+            or self.io_dtype != "bfloat16"
+            or self.hidden_size % 256
+            or self.intermediate_size % 128
+        ):
+            raise ValueError(
+                "weighted MXFP8 weight preparation requires BF16 SiLU MXFP4 A8, H%256=0 and I%128=0"
+            )
         object.__setattr__(
             self,
             "transforms",

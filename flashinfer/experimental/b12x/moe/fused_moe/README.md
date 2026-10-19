@@ -1,3 +1,39 @@
+# Retained routed-expert output
+
+The experimental canonical `plan_execution` API accepts
+`RoutingSpec(output_layout="token_and_routes")` when a caller needs individual
+weighted BF16 expert results as well as the reduced token output. The default
+`output_layout="token_sum"` requires only the ordinary token result and retains
+its full tactic set.
+
+Retained route rows use the existing deterministic grouped dynamic kernels.
+They require BF16 I/O and deterministic output. Omitted `deterministic_output`
+becomes `True`; an explicit `False` is rejected. Micro, W4A16, direct-scatter,
+and atomic materialization tactics cannot satisfy this output contract and are
+excluded. All remaining legal tiles and lowering choices participate in normal
+autotuning. The requirement is part of query, selection-cache, and compilation
+identity; it does not override the weight plan's numerical recipe.
+
+After binding, `binding.route_output[:T * K].view(T, K, H)` contains the original
+token/top-k slots, including zero rows for masked IDs. The rows include routing
+weights according to the declared numerical recipe. They alias caller-owned
+scratch and remain valid until that scratch is reused. `binding.output` remains
+the reduced `[T,H]` result. Preparation and binding reject a selected tactic or
+storage layout that cannot retain these rows.
+
+The CPU contract checks cover query and selection-cache separation, tactic
+eligibility, numerical recipe preservation, scratch capacity, and binding
+validation. The SM120/SM121 test prepares autotuned NVFP4 execution with native
+or compressed scales and checks weighted slot order, masked routes, changed
+activations, and caller-owned storage under CUDA graph replay:
+
+```sh
+PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
+  python -m pytest -q tests/experimental/b12x/moe/test_retained_route_contract.py
+PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
+  python -m pytest -q tests/experimental/b12x/moe/test_retained_route_contract_cuda.py
+```
+
 # W4A16 with NVFP4 activation prefill
 
 Expert-presence marking, NVFP4-CSF scale expansion, and deterministic dynamic
@@ -146,3 +182,102 @@ PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
 The two-device ownership check requires two visible SM120 GPUs. These checks
 verify the specified lossy arithmetic and replay behavior; they do not measure
 model accuracy or serving throughput.
+
+## Weighted MXFP8 W4A8 recipe matching Cake MegaMoE
+
+The declaration field `invocation["numerical_recipe"]` accepts the value
+`"bf16_fc1_silu_fp32_route_weight_mxfp8_floor105"`
+(`b12x.moe._shared.numerics.BF16_FC1_WEIGHTED_MXFP8`): the arithmetic of SM103
+Cake MegaMoE for MXFP4 experts, so that an SM120 bank's weighted route rows can
+be reduced with Cake's. It is an explicit numerical contract, independent of
+environment throughput controls. Other non-null recipe strings raise an error.
+
+The same `numerical_recipe=` is required when declaring `plan_weights` (or
+the raw `plan_b12x_fp4_moe_weights`). The prepared owner and execution plan
+must agree; execution cannot reinterpret weights prepared with stock scale
+clamping. Canonical execution inherits its owner's recipe when invocation
+omits it, and rejects an explicit mismatch.
+
+For this weight recipe, integer MXFP4 scale preparation preserves all 256
+UE8M0 bytes during raw-grid repacking and `Mxfp4CsfWeights` expansion. The
+stock path retains its clamp at 247. Lossless CSF sources and caller-owned
+scale expansion buffers use the existing FI scale plan; no extra format or
+permanent expanded scale owner is introduced. Byte 255 is preserved as a
+byte; this does not claim that arithmetic on nonfinite scales is finite.
+
+The recipe supports SM120 BF16 input/output, plain MXFP4
+`fp4_e8m0_k32` weights, SiLU with gate-upper/up-symmetric clamp10, hidden size
+aligned to 256, intermediate size aligned to 128, and deterministic grouped
+materialized M64 or M128 execution. Its default is M128. It rejects micro,
+M16/M32, direct routing, external routing, ready queues, N64 tails, Trellis,
+activation-amax collection, and input router weighting. Routing IDs must be
+contiguous INT32/INT64 and routing weights must be the caller's contiguous
+FP32 values. A different binding fast-math contract is rejected.
+
+Both source BF16 input packing and the weighted FP32 intermediate use the
+Cake exponent rule:
+
+```text
+ue8m0 = max((float32_bits(amax) + 0x1fffff) >> 23, 113) - 8
+inverse_scale = float32_from_bits((254 - ue8m0) << 23)
+```
+
+Zero and tiny blocks retain scale byte 105. FC1 alpha/global-input scaling
+precedes BF16 round-to-nearest-even of gate and up. The clamped BF16 values
+are widened to FP32 for approximate SiLU, multiplied by the original FP32
+routing weight, and quantized directly to MXFP8 without an activated BF16
+round. FC2 consumes that already weighted intermediate and does not multiply
+the routing weight again. W4A8 input packing is independent of per-expert
+global scales, which remain FC1 metadata.
+
+The recipe is retained by scratch capacities and execution plans, included
+in compiler/cache identity, and encoded in the existing dynamic launch-policy
+word to preserve the pinned 64-argument custom-op ABI. Caller scratch extents
+and stock recipe/cache keys are unchanged. All required programs must still
+be prepared/warmed before graph capture.
+
+The host checks and SM120 qualification are:
+
+```sh
+PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
+  python -m pytest tests/experimental/b12x/moe/test_cake_w4a8_numerics.py -q
+PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
+  python -m pytest tests/experimental/b12x/moe/test_cake_w4a8_numerics_cuda.py -v
+PYTHONPATH="$PWD:$PWD/flashinfer/experimental/b12x/_compat" \
+  python -m pytest tests/experimental/b12x/moe/test_cake_w4a8_scale_bytes.py -v
+```
+
+The GPU checks inspect exact source-input and intermediate bytes, original
+FP32 route weights, FC2 weighting once, changed-input CUDA graph replay, and
+caller scratch poisoning. Boundary tests do not establish bitwise agreement
+between SM103 and SM120 GEMM accumulator schedules: different FP32 reduction
+orders can cross a BF16 halfway point.
+
+A physical worker bank may contain fewer experts than the original top-k.
+For this recipe only, canonical declarations accept that geometry when
+`ExecutionCapacity.route_num_experts` records the real global router domain
+(for example 384 for DSV4.1-Flash, or 128 for its top3 draft). Top-k remains
+unchanged and is limited to 1 through 8. Precomputed local IDs outside
+`[0, local_experts)` are inactive. The grouped router ignores them, and the
+existing cooperative prologue zeros only their route-output rows before FC2.
+Empty banks therefore return zeros, including after an active replay; no
+fake expert, removed slot, or bank-local weight renormalization is needed.
+Stock recipes keep their previous eligibility and kernel behavior.
+
+The actual H5120/I2304 bank test is
+`tests/experimental/b12x/moe/test_cake_w4a8_ds41_banks_cuda.py`. It uses real
+MXFP4 byte/scale layouts with synthetic analytical weights, physical E1/top3
+and E2/top6 banks, one persistent max4096 scratch allocation, live-count graph
+transitions 1/17/128/4096 and back down, changed IDs/weights, and mixed/empty
+local routing. It inspects weighted BF16 results in original token/slot order
+before the token sum. A worker can return its retained route-output view, or
+capture a copy into a dedicated fixed-capacity return buffer; keep that storage
+alive until transport and the consuming join finish.
+
+The current prepared BF16 API requires input `[M,5120]` BF16, local IDs `[M,K]`
+INT32, and unchanged weights `[M,K]` FP32. The worker returns `[M,K,5120]` BF16.
+At M4096, input tensors occupy 42,041,344 bytes for top3 or 42,139,648 bytes
+for top6, before span alignment. Return tensors occupy 125,829,120 or
+251,658,240 bytes. Transporting prequantized MXFP8 would require a separately
+qualified FI input ABI; this extension keeps quantization inside the prepared
+worker graph.

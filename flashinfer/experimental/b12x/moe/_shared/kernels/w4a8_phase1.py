@@ -34,6 +34,7 @@ from b12x._lib.intrinsics.memory import (
     ld_shared_v2_u32,
     ld_shared_v4_u32,
     shared_ptr_to_u32,
+    u32_as_f32,
 )
 from b12x._lib.intrinsics.mma import (
     e2m1x8_to_qmma_e2m1x8,
@@ -44,8 +45,14 @@ from b12x._lib.intrinsics.atomics import (
     ld_shared_bf16_to_f32,
     ld_shared_u32,
     st_shared_u32,
+    st_shared_f32,
+    ld_shared_f32,
 )
-from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
+from b12x.moe._shared.numerics import (
+    BF16_FC1_WEIGHTED_MXFP8,
+    validate_numerical_recipe,
+)
+from b12x._lib.intrinsics.packed import f32_to_raw_bits, pack_f32x2_to_bfloat2
 from b12x._lib.intrinsics.quantization import quantize_block_fp8_mx
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
@@ -59,6 +66,25 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
+
+
+@cute.jit
+def quantize_block_fp8_cake(values: cute.Tensor, block_max: cutlass.Float32):
+    """Cake FP32-to-MXFP8: bitwise ceil exponent with a UE8M0 floor of 105."""
+    exponent = cutlass.max(
+        (f32_to_raw_bits(block_max) + Uint32(0x1FFFFF)) >> Uint32(23),
+        Uint32(113),
+    ) - Uint32(8)
+    inverse = u32_as_f32((Uint32(254) - exponent) << Uint32(23))
+    payload = cute.make_rmem_tensor((8,), Uint32)
+    for word in cutlass.range_constexpr(8):
+        payload[word] = cvt_f32x4_to_e4m3x4(
+            values[word * 4] * inverse,
+            values[word * 4 + 1] * inverse,
+            values[word * 4 + 2] * inverse,
+            values[word * 4 + 3] * inverse,
+        )
+    return payload, exponent
 
 
 class W4A8MaterializedPhase1Kernel:
@@ -85,7 +111,23 @@ class W4A8MaterializedPhase1Kernel:
         trellis_direct_lut: bool = False,
         n64_repacked: bool = False,
         n64_tail: bool = False,
+        numerical_recipe: str | None = None,
     ):
+        self.numerical_recipe = validate_numerical_recipe(numerical_recipe)
+        self.weighted_mxfp8 = self.numerical_recipe == BF16_FC1_WEIGHTED_MXFP8
+        if self.weighted_mxfp8 and not (
+            activation == "silu"
+            and swiglu_limit == 10.0
+            and trellis_bits is None
+            and source_tile_m in (64, 128)
+            and deterministic_output
+            and fast_math
+            and not n64_repacked
+            and not n64_tail
+        ):
+            raise ValueError(
+                "weighted MXFP8 phase 1 requires deterministic plain M64/M128 SiLU/clamp10"
+            )
         self.fast_math = bool(fast_math)
         self.csf_inline = False
         self.has_swiglu_limit = swiglu_limit is not None
@@ -116,7 +158,9 @@ class W4A8MaterializedPhase1Kernel:
         self.up_sfb_offset = self.gate_sfb_offset + self.sfb_bytes
         self.stage_bytes = self.up_sfb_offset + self.sfb_bytes
         self.pipeline_bytes = self.stages * self.stage_bytes
-        self.epilogue_bytes = self.tile_m * self.tile_n * 2
+        self.epilogue_bytes = (
+            self.tile_m * self.tile_n * (4 if self.weighted_mxfp8 else 2)
+        )
         self.shared_bytes = max(self.pipeline_bytes, self.epilogue_bytes)
         self.shared_words = (self.shared_bytes + 3) // 4
         self.source_tile_m = int(source_tile_m)
@@ -588,6 +632,9 @@ class W4A8MaterializedPhase1Kernel:
     ) -> cutlass.Float32:
         gate = alpha_value * gate
         up = alpha_value * up
+        if cutlass.const_expr(self.weighted_mxfp8):
+            gate = gate.to(cutlass.BFloat16).to(cutlass.Float32)
+            up = up.to(cutlass.BFloat16).to(cutlass.Float32)
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             gate = cutlass.min(gate, limit)
@@ -1167,14 +1214,41 @@ class W4A8MaterializedPhase1Kernel:
                     act3 = self._activated_value(
                         gate_fragment[3], up_fragment[3], alpha_value
                     )
-                    st_shared_u32(
-                        epilogue_base + (row_lo * Int32(self.tile_n) + col) * Int32(2),
-                        pack_f32x2_to_bfloat2(act0, act1),
-                    )
-                    st_shared_u32(
-                        epilogue_base + (row_hi * Int32(self.tile_n) + col) * Int32(2),
-                        pack_f32x2_to_bfloat2(act2, act3),
-                    )
+                    if cutlass.const_expr(self.weighted_mxfp8):
+                        physical_base = Int64(source_m_tile) * Int64(
+                            self.source_tile_m
+                        ) + Int64(m_half * self.tile_m)
+                        lo_weight = cutlass.Float32(0.0)
+                        hi_weight = cutlass.Float32(0.0)
+                        if row_lo < valid_rows:
+                            lo_weight = token_weights[physical_base + row_lo].to(
+                                cutlass.Float32
+                            )
+                        if row_hi < valid_rows:
+                            hi_weight = token_weights[physical_base + row_hi].to(
+                                cutlass.Float32
+                            )
+                        lo = epilogue_base + (
+                            row_lo * Int32(self.tile_n) + col
+                        ) * Int32(4)
+                        hi = epilogue_base + (
+                            row_hi * Int32(self.tile_n) + col
+                        ) * Int32(4)
+                        st_shared_f32(lo, act0 * lo_weight)
+                        st_shared_f32(lo + Int32(4), act1 * lo_weight)
+                        st_shared_f32(hi, act2 * hi_weight)
+                        st_shared_f32(hi + Int32(4), act3 * hi_weight)
+                    else:
+                        st_shared_u32(
+                            epilogue_base
+                            + (row_lo * Int32(self.tile_n) + col) * Int32(2),
+                            pack_f32x2_to_bfloat2(act0, act1),
+                        )
+                        st_shared_u32(
+                            epilogue_base
+                            + (row_hi * Int32(self.tile_n) + col) * Int32(2),
+                            pack_f32x2_to_bfloat2(act2, act3),
+                        )
 
         cute.arch.sync_threads()
 
@@ -1253,16 +1327,27 @@ class W4A8MaterializedPhase1Kernel:
                     values = cute.make_rmem_tensor((32,), cutlass.Float32)
                     block_max = cutlass.Float32(0.0)
                     for elem in cutlass.range_constexpr(32):
-                        value = ld_shared_bf16_to_f32(
-                            epilogue_base
-                            + (tid * Int32(self.tile_n) + Int32(block * 32 + elem))
-                            * Int32(2)
-                        )
+                        if cutlass.const_expr(self.weighted_mxfp8):
+                            value = ld_shared_f32(
+                                epilogue_base
+                                + (tid * Int32(self.tile_n) + Int32(block * 32 + elem))
+                                * Int32(4)
+                            )
+                        else:
+                            value = ld_shared_bf16_to_f32(
+                                epilogue_base
+                                + (tid * Int32(self.tile_n) + Int32(block * 32 + elem))
+                                * Int32(2)
+                            )
                         values[elem] = value
                         abs_value = fabs_f32(value)
                         if abs_value > block_max:
                             block_max = abs_value
-                    if cutlass.const_expr(self.w4a8_trellis):
+                    if cutlass.const_expr(self.weighted_mxfp8):
+                        # The Cake MegaMoE exponent rule: zero and tiny blocks keep exponent
+                        # 105, and the weighted FP32 activation is not rounded to BF16 first.
+                        payload, scale_byte = quantize_block_fp8_cake(values, block_max)
+                    elif cutlass.const_expr(self.w4a8_trellis):
                         payload, scale_byte = quantize_block_fp8_mx(
                             _w4a8_trellis_permute_k32(values), block_max
                         )

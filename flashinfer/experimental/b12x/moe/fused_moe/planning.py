@@ -136,6 +136,10 @@ class WeightPlan:
     _impl: MoEWeightPreparationPlan
     scale_compression: str | None = None
 
+    @property
+    def numerical_recipe(self):
+        return self._impl.numerical_recipe
+
 
 def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
     """Map a packed source format and activation mode to its quant recipe."""
@@ -246,6 +250,7 @@ def plan_weights(
     activation: ActivationSpec,
     geometry: MoEGeometry,
     constraints: WeightPlanConstraints | None = None,
+    numerical_recipe: str | None = None,
 ) -> WeightPlan:
     """Plan preparation from independent source, activation, and shape axes."""
 
@@ -253,6 +258,19 @@ def plan_weights(
         raise TypeError("activation must be an ActivationSpec")
     if not isinstance(geometry, MoEGeometry):
         raise TypeError("geometry must be a MoEGeometry")
+    from .._shared.numerics import validate_numerical_recipe
+
+    validate_numerical_recipe(numerical_recipe)
+    if numerical_recipe is not None and (
+        not isinstance(source, PackedSource)
+        or activation.mode is not ActivationMode.A8
+        or activation.swiglu_limit != 10.0
+        or activation.swiglu_alpha is not None
+        or activation.swiglu_beta is not None
+    ):
+        raise ValueError(
+            "weighted MXFP8 weight preparation requires packed A8 weights and SwiGLU clamp 10"
+        )
     constraints = constraints or WeightPlanConstraints()
     if not isinstance(constraints, WeightPlanConstraints):
         raise TypeError("constraints must be WeightPlanConstraints")
@@ -312,6 +330,7 @@ def plan_weights(
             intermediate_size=geometry.intermediate_size,
             w13_layout="w13" if shared_a16 else source.w13_layout.value,
             w4a16_layout=requested_layout,
+            numerical_recipe=numerical_recipe,
         )
     elif isinstance(source, TrellisSource):
         config = source.config

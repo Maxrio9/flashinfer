@@ -6,6 +6,10 @@ import b12x.moe._shared.kernels.w4a16.kernel.direct_launch as _module_moe__share
 
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
+from b12x.moe._shared.numerics import (
+    BF16_FC1_WEIGHTED_MXFP8,
+    validate_numerical_recipe,
+)
 
 import os
 import logging
@@ -801,6 +805,7 @@ class TPMoEPlan:
     quant_mode: str
     activation: str
     decode_config: MoeDecodeConfig
+    numerical_recipe: str | None = None
     swiglu_limit: float | None = None
     swiglu_clamp_after_silu: bool = False
     swiglu_alpha: float = 1.0
@@ -831,6 +836,7 @@ class TPMoEScratchCaps:
     weight_plan: MoEWeightPreparationPlan
     quant_mode: str
     decode_config: MoeDecodeConfig
+    numerical_recipe: str | None = None
     core_token_counts: tuple[int, ...] | None = None
     route_num_experts: int | None = None
     route_logits_dtype: torch.dtype | None = None
@@ -856,10 +862,15 @@ class TPMoEScratchCaps:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
         object.__setattr__(self, "device", torch.device(self.device))
+        validate_numerical_recipe(self.numerical_recipe)
         if not isinstance(self.decode_config, MoeDecodeConfig):
             raise TypeError("decode_config must be a concrete MoeDecodeConfig")
         if not isinstance(self.weight_plan, MoEWeightPreparationPlan):
             raise TypeError("weight_plan must be a MoEWeightPreparationPlan")
+        if self.numerical_recipe != self.weight_plan.numerical_recipe:
+            raise ValueError(
+                "execution numerical_recipe must match the prepared weight plan"
+            )
         quant_mode = _normalize_quant_mode_for_source(
             self.quant_mode,
             self.weight_plan.source_format,
@@ -2855,6 +2866,9 @@ def _heuristic_moe_decode_config(
             and query.routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
         ):
             backend = "dynamic"
+    if query.output_layout == "token_and_routes" and backend == "micro":
+        # Micro and W4A16 bindings expose only their reduced token output.
+        backend = "dynamic"
     dynamic_tile_m = None
     dynamic_route_mode = None
     if backend == "dynamic":
@@ -3020,6 +3034,21 @@ def _build_tp_moe_fp4_binding_from_views(
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+    if execution_plan.numerical_recipe is not None:
+        if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
+            raise TypeError(
+                "weighted MXFP8 requires original contiguous FP32 route weights"
+            )
+        if not topk_ids.is_contiguous() or topk_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise TypeError("weighted MXFP8 requires contiguous INT32/INT64 route IDs")
+        if fast_math is False or activation_amax is not None:
+            raise ValueError(
+                "weighted MXFP8 requires fast math without activation amax"
+            )
+        fast_math = True
     if a.ndim != 2:
         raise ValueError(
             f"expected input activations with rank 2, got {tuple(a.shape)}"
@@ -4837,6 +4866,7 @@ def _e8m0_scale_to_grid_kernel(
     grid_expert_stride: tl.constexpr,
     source_is_logical: tl.constexpr,
     BLOCK: tl.constexpr,
+    PRESERVE_BYTES: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     idx = pid * BLOCK + tl.arange(0, BLOCK)
@@ -4857,7 +4887,8 @@ def _e8m0_scale_to_grid_kernel(
         src_byte = tl.where(byte == 1, 2, tl.where(byte == 2, 1, byte))
         src_off = expert * scale_expert_stride + group4 * 4 + src_byte
     values = tl.load(scale + src_off, mask=mask, other=0)
-    values = tl.minimum(values, 247)
+    if not PRESERVE_BYTES:
+        values = tl.minimum(values, 247)
     tl.store(
         grid + expert * grid_expert_stride + row * scale_cols + col,
         values,
@@ -5568,7 +5599,9 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
     k_dim: int,
     row_rotation: int | None = None,
     gated_half_rows: int | None = None,
+    numerical_recipe: str | None = None,
 ) -> torch.Tensor:
+    preserve_bytes = validate_numerical_recipe(numerical_recipe) is not None
     weight_E = int(weight_E)
     rows = int(rows)
     k_dim = int(k_dim)
@@ -5634,6 +5667,7 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
                 total_per_expert,
                 is_logical,
                 BLOCK=block,
+                PRESERVE_BYTES=preserve_bytes,
                 num_warps=4,
             )
             dst_chunk = out_u8[e0:e1] if has_tail else scale_u8[e0:e1]
@@ -5670,7 +5704,8 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
     for expert in range(weight_E):
         if is_logical:
             grid_scratch.copy_(scale_u8[expert])
-            grid_scratch.clamp_(max=247)
+            if not preserve_bytes:
+                grid_scratch.clamp_(max=247)
         else:
             _recover_w4a16_e8m0_scale_expert(
                 scale_u8[expert],
@@ -6404,7 +6439,13 @@ def _prepare_w4a8_from_e8m0_source(
     source_format: str,
     w13_layout: str,
     n64_repack: bool = False,
+    numerical_recipe: str | None = None,
 ) -> _PreparedW4A8Weights:
+    validate_numerical_recipe(numerical_recipe)
+    if numerical_recipe is not None and n64_repack:
+        raise ValueError(
+            "weighted MXFP8 weight preparation does not support N64 repacking"
+        )
     source_format = _normalize_fp4_source_format(source_format)
     if source_format != "fp4_e8m0_k32":
         raise ValueError(
@@ -6507,12 +6548,14 @@ def _prepare_w4a8_from_e8m0_source(
             k_dim=k,
             row_rotation=row_rotation,
             gated_half_rows=n if is_gated else None,
+            numerical_recipe=numerical_recipe,
         )
         w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
             w2_blockscale,
             weight_E=weight_E,
             rows=k,
             k_dim=n,
+            numerical_recipe=numerical_recipe,
         )
     return _PreparedW4A8Weights(
         w13_rp=w13_rp,
@@ -6723,6 +6766,7 @@ def plan_b12x_fp4_moe_weights(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
     intermediate_hadamard_blocks: tuple[int, int] | None = None,
+    numerical_recipe: str | None = None,
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -6760,6 +6804,7 @@ def plan_b12x_fp4_moe_weights(
     return replace(
         result,
         csf_inline_scales=bool(csf_inline_scales),
+        numerical_recipe=validate_numerical_recipe(numerical_recipe),
     )
 
 
@@ -6884,6 +6929,12 @@ def prepare_b12x_fp4_moe_weights(
         )
     if w1_fp4 is None or w2_fp4 is None:
         raise ValueError("weight preparation requires both w1_fp4 and w2_fp4")
+    if (
+        plan.numerical_recipe is not None
+        and w1_fp4.is_cuda
+        and torch.cuda.get_device_capability(w1_fp4.device) != (12, 0)
+    ):
+        raise ValueError("weighted MXFP8 weight preparation requires SM120")
 
     required_tensors = {
         "w1_global_scale": w1_global_scale,
@@ -7012,6 +7063,7 @@ def prepare_b12x_fp4_moe_weights(
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
             n64_repack=plan.intermediate_size % 128 == 64,
+            numerical_recipe=plan.numerical_recipe,
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a8_mx",
@@ -7434,6 +7486,7 @@ def plan_tp_moe_execution(
     apply_router_weight_on_input: bool = False,
     deterministic_output: bool | None = None,
     decode_config: MoeDecodeConfig,
+    numerical_recipe: str | None = None,
 ) -> TPMoEPlan:
     """Lower one recipe from an authoritative weight-preparation plan.
 
@@ -7446,6 +7499,7 @@ def plan_tp_moe_execution(
         quant_mode,
         weight_plan.source_format,
     )
+    validate_numerical_recipe(numerical_recipe)
     if quant_mode not in weight_plan.quant_modes:
         raise ValueError(f"quant_mode={quant_mode!r} is absent from the weight plan")
     try:
@@ -7495,6 +7549,26 @@ def plan_tp_moe_execution(
             quant_mode=quant_mode,
             device=device,
         )
+    if numerical_recipe is not None and not (
+        quant_mode == "w4a8_mx"
+        and source_format == "fp4_e8m0_k32"
+        and dtype is torch.bfloat16
+        and activation == "silu"
+        and swiglu_limit == 10.0
+        and swiglu_alpha == 1.0
+        and swiglu_beta == 0.0
+        and not apply_router_weight_on_input
+        and deterministic_output
+        and 0 < num_topk <= 8
+        and k % 256 == 0
+        and n % 128 == 0
+        and decode_config.backend == "dynamic"
+        and decode_config.route_planner == "internal"
+        and decode_config.dynamic_route_mode == "grouped"
+        and decode_config.dynamic_tile_m in (64, 128)
+        and _dynamic_work_source() != "ready_queue"
+    ):
+        raise ValueError("weighted MXFP8 requires BF16 plain grouped M64/M128 W4A8 MX")
     dynamic_physical_tiles = None
     dynamic_task_capacity = None
     dynamic_tile_m = None
@@ -7640,6 +7714,7 @@ def plan_tp_moe_execution(
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
         decode_config=decode_config,
+        numerical_recipe=numerical_recipe,
     )
 
 
@@ -9017,6 +9092,7 @@ def plan_tp_moe_scratch(
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         deterministic_output=deterministic_output,
         decode_config=caps.decode_config,
+        numerical_recipe=caps.numerical_recipe,
     )
     resolved_block_size_m = _resolve_trellis_route_block_size(caps)
     core_workspace_plan = _plan_core_workspace(
@@ -9644,6 +9720,7 @@ def materialize_tp_moe_arena_workspaces(
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=deterministic_output,
             decode_config=caps.decode_config,
+            numerical_recipe=caps.numerical_recipe,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -11235,11 +11312,44 @@ def _get_dynamic_kernel(
     trellis_intermediate_hadamard: bool = False,
     planned_tile_m: int | None = None,
     planned_num_tokens: int | None = None,
+    numerical_recipe: str | None = None,
 ):
     """Resolve, compile, and cache the dynamic MoE kernel specialization for this
     launch geometry.
     """
     quant_mode = _normalize_quant_mode(quant_mode)
+    numerical_recipe = validate_numerical_recipe(numerical_recipe)
+    if numerical_recipe == BF16_FC1_WEIGHTED_MXFP8:
+        if not (
+            quant_mode == "w4a8_mx"
+            and w4a8_repacked
+            and not w4a8_n64_repacked
+            and deterministic_output
+            and activation == "silu"
+            and swiglu_limit == 10.0
+            and not direct_routing
+            and not external_route_plan
+            and not trellis_bits
+            and planned_tile_m in (64, 128)
+            and 0 < num_topk <= 8
+            and fast_math
+            and k % 256 == 0
+            and n % 128 == 0
+            and _current_compute_capability() == (12, 0)
+            and _select_dynamic_tile_mn(
+                m * num_topk,
+                n,
+                quant_mode,
+                num_experts=E,
+                activation=activation,
+                planned_tile_m=planned_tile_m,
+            )[0]
+            == planned_tile_m
+        ):
+            raise ValueError(
+                "weighted MXFP8 requires deterministic grouped M64/M128 W4A8 MX"
+            )
+        share_input_across_experts = True
     # Both MX byte-container recipes ride the nvfp4-shaped launch ABI (no
     # repack/residual operands) and the MXFP8 activation scratch with UE8M0
     # K/32 scales (sf_vec_size 32).  w6a8_mx passes Float8E4M3FN views of the
@@ -11295,6 +11405,8 @@ def _get_dynamic_kernel(
         deterministic_output=deterministic_output,
         planned_tile_m=planned_tile_m,
     ) or (quant_mode == "nvfp4" and nvfp4_materialize_intermediate)
+    if numerical_recipe is not None:
+        materialize_intermediate = True
     if w4a8_n64_repacked and not w4a8_repacked:
         raise ValueError("w4a8_n64_repacked requires repacked W4A8 weights")
     if w4a8_n64_repacked and n % 64 != 0:
@@ -11364,6 +11476,8 @@ def _get_dynamic_kernel(
         bool(trellis_intermediate_hadamard),
         *(("csf_inline_scales",) if csf_inline_scales else ()),
     )
+    if numerical_recipe is not None:
+        cache_key = ("numerical_recipe", numerical_recipe, 1, *cache_key)
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED",
         "B12X_LEVEL10_REUSE_COMPILED",
@@ -11398,6 +11512,8 @@ def _get_dynamic_kernel(
         fast_math=fast_math,
         dynamic_down_scale=dynamic_down_scale,
     )
+    if numerical_recipe is not None:
+        kernel_kwargs["numerical_recipe"] = numerical_recipe
     if mma_warps is not None:
         kernel_kwargs["mma_warps"] = mma_warps
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
@@ -11781,9 +11897,13 @@ def _launch_dynamic_flat(
     planned_tile_m: int,
     planned_direct_routing: bool,
     planned_num_tokens: int,
+    numerical_recipe: str | None = None,
 ) -> None:
     """Launch the compiled dynamic MoE kernel over bound workspace and weight views."""
     quant_mode = _normalize_quant_mode(quant_mode)
+    validate_numerical_recipe(numerical_recipe)
+    if numerical_recipe is not None:
+        share_input_across_experts = True
     # Output rows follow the reduction contract, never an independent caller
     # quantity: deterministic kernels write one row per route, others per token.
     scatter_rows = routed_rows if deterministic_output else m
@@ -11886,7 +12006,9 @@ def _launch_dynamic_flat(
             default=external_route_plan_requested,
         )
     )
-    materialize_intermediate = materialize_intermediate or w4a8_n64_repacked
+    materialize_intermediate = (
+        materialize_intermediate or w4a8_n64_repacked or numerical_recipe is not None
+    )
     if materialize_intermediate:
         required_intermediate_bytes = _dynamic_materialized_intermediate_bytes(
             quant_mode=quant_mode,
@@ -11993,6 +12115,7 @@ def _launch_dynamic_flat(
         trellis_intermediate_hadamard=trellis_intermediate_hadamard,
         planned_tile_m=planned_tile_m,
         planned_num_tokens=planned_num_tokens,
+        numerical_recipe=numerical_recipe,
     )
     if volatile_launch_state and not external_route_plan:
         barrier_count.zero_()
@@ -12135,7 +12258,9 @@ def _encode_dynamic_launch_policy(
     csf_inline_scales: bool = False,
     mma_warps: int | None = None,
     swiglu_clamp_after_silu: bool = False,
+    numerical_recipe: str | None = None,
 ) -> int:
+    validate_numerical_recipe(numerical_recipe)
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
     except KeyError as exc:
@@ -12146,7 +12271,7 @@ def _encode_dynamic_launch_policy(
         raise ValueError("policy_max_active_clusters must be -1 or nonnegative")
     if mma_warps not in (None, 4):
         raise ValueError("compute warps must be four or the tile default")
-    return (
+    policy = (
         int(bool(volatile_launch_state))
         | (int(bool(external_route_plan_requested)) << 1)
         | (tile_code << 2)
@@ -12158,12 +12283,18 @@ def _encode_dynamic_launch_policy(
         | (int(bool(csf_inline_scales)) << 9)
         | ((int(policy_max_active_clusters) + 1) << 10)
     )
+    # The dispatcher already has PyTorch's 64-argument maximum. Stock policy
+    # words are nonnegative; a negative word carries the explicit recipe with
+    # the same lossless scheduling payload and no additional dispatcher slot.
+    return -policy - 1 if numerical_recipe is not None else policy
 
 
 def _decode_dynamic_launch_policy(
     value: int,
 ) -> tuple[bool, bool, int, bool, bool, bool, int | None, int]:
     value = int(value)
+    if value < 0:
+        value = -value - 1
     return (
         bool(value & 1),
         bool(value & 2),
@@ -12284,7 +12415,10 @@ def _tp_moe_dynamic_launch_op(
         mma_warps,
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
-    swiglu_clamp_after_silu = bool(launch_policy & 256)
+    numerical_recipe = BF16_FC1_WEIGHTED_MXFP8 if launch_policy < 0 else None
+    # A negative word carries the weighted recipe; its flag bits are those of -word - 1.
+    policy_bits = -launch_policy - 1 if launch_policy < 0 else launch_policy
+    swiglu_clamp_after_silu = bool(policy_bits & 256)
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
@@ -12345,7 +12479,7 @@ def _tp_moe_dynamic_launch_op(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
-        csf_inline_scales=bool(launch_policy & 512),
+        csf_inline_scales=bool(policy_bits & 512),
         mma_warps=mma_warps,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
@@ -12359,6 +12493,7 @@ def _tp_moe_dynamic_launch_op(
         planned_tile_m=planned_tile_m,
         planned_direct_routing=planned_direct_routing,
         planned_num_tokens=planned_num_tokens,
+        numerical_recipe=numerical_recipe,
     )
 
 
@@ -12469,8 +12604,12 @@ def _launch_dynamic(
     planned_tile_m: int = 128,
     dynamic_route_mode: str = "grouped",
     planned_num_tokens: int | None = None,
+    numerical_recipe: str | None = None,
 ) -> None:
     del stream
+    validate_numerical_recipe(numerical_recipe)
+    if numerical_recipe is not None:
+        share_input_across_experts = True
     if dynamic_route_mode not in {"direct", "grouped"}:
         raise ValueError("dynamic_route_mode must be 'direct' or 'grouped'")
     launch_policy = _encode_dynamic_launch_policy(
@@ -12484,6 +12623,7 @@ def _launch_dynamic(
         csf_inline_scales=csf_inline_scales is not None,
         mma_warps=mma_warps,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+        numerical_recipe=numerical_recipe,
     )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
@@ -13953,6 +14093,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
                 (quant_mode == "nvfp4" and decode_config.nvfp4_share_input)
+                or plan.numerical_recipe is not None
                 or (
                     dynamic_w4a8_prepared is not None
                     and _env_flag(
@@ -13961,6 +14102,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     )
                 )
             ),
+            numerical_recipe=plan.numerical_recipe,
         )
         if deterministic_output:
             _launch_dynamic_topk_sum(
