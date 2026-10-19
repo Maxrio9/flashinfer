@@ -12,6 +12,11 @@ _EXPORTS = {
     "DirectWeightSession": "._checkpoint",
     "SharedReadGroup": "._shared_checkpoint",
     "CheckpointDisplay": "._progress",
+    "CsfSource": "._csf_source",
+    "CsfScaleSpec": "._cake_scale_operand",
+    "CsfScaleBuffers": "._cake_scale_operand",
+    "PreparedCsfScales": "._cake_scale_operand",
+    "count_csf_scales": "._cake_csf",
 }
 
 __all__ = list(_EXPORTS)
