@@ -32,13 +32,25 @@ def stage_program(stage, arch):
     return program if isinstance(program, str) else program[arch]
 
 
-def load_program(arch, name, num_sms):
-    """Build and load program ``name`` for ``arch``; ``NUM_CTAS`` is the route's SM count."""
+def load_program(arch, name, num_sms, *, weight_scales=None):
+    """Build and load program ``name`` for ``arch``; ``NUM_CTAS`` is the route's SM count.
+
+    With ``weight_scales`` (a ``CsfScaleSpec`` or ``PreparedCsfScales``) the
+    program is the masked local-bank variant that consumes producer scales on
+    chip, compiled for that bank extent.
+    """
+    if weight_scales is not None:
+        from ._csf_program import load_csf_program
+        from .scales import scale_spec
+
+        return load_csf_program(
+            catalog(), arch, name, num_sms, scale_spec(weight_scales)
+        )
     definitions = catalog().definitions(arch, name, {"NUM_CTAS": int(num_sms)})
     return catalog().load_program(arch, name, definitions)
 
 
-def key(surface, args):
+def key(surface, args, *, weight_scales=None):
     names = (
         (
             "num_tokens",
@@ -56,19 +68,55 @@ def key(surface, args):
             else ("num_experts", "per_expert_M", "hidden", "intermediate")
         )
     )
-    return json.dumps(
-        [surface, {k: args[k] for k in names}], sort_keys=True, separators=(",", ":")
-    )
+    fields = {k: args[k] for k in names}
+    if weight_scales is not None:
+        from .scales import scale_spec
+
+        spec = scale_spec(weight_scales)
+        spec.validate_args(surface, args)
+        fields["weight_scales"] = spec.identity()
+    return json.dumps([surface, fields], sort_keys=True, separators=(",", ":"))
 
 
-def _route(arch, surface, args):
-    """Catalogued route for ``surface``/``args``; unknown routes raise."""
+def _route(arch, surface, args, *, weight_scales=None):
+    """Catalogued route for ``surface``/``args``; unknown routes raise.
+
+    With ``weight_scales`` the returned copy of an SM103 pipeline route also
+    names the scale identity and a prepared key that includes it. Raw keys and
+    records keep their original bytes and object identity.
+    """
     try:
-        return catalog().routes(arch)[key(surface, args)]
+        route = catalog().routes(arch)[key(surface, args)]
     except KeyError as error:
         raise RuntimeError(
             f"No exported {arch} {surface} schedule for {args}"
         ) from error
+    if weight_scales is None:
+        return route
+    from .scales import scale_spec
+
+    spec = scale_spec(weight_scales)
+    spec.validate_args(surface, args)
+    from ._csf_producer_source import CAPACITIES, program
+
+    if (
+        arch != "sm_103a"
+        or not route["metadata"].get("self_cleaning")
+        or len(route["stages"]) != 1
+        or route["stages"][0]["name"] != "pipeline"
+        or stage_program(route["stages"][0], arch)
+        not in {program(cap) for cap in CAPACITIES}
+    ):
+        raise ValueError("selected pipeline has no compressed-scale source contract")
+    return {
+        **route,
+        "stages": [dict(stage) for stage in route["stages"]],
+        "metadata": {
+            **route["metadata"],
+            "weight_scales": spec.identity(),
+            "prepared_key": key(surface, args, weight_scales=spec),
+        },
+    }
 
 
 def _route_arch(route, device):
@@ -84,10 +132,12 @@ def _route_arch(route, device):
 
 
 class _Stage:
-    def __init__(self, arch, program, num_sms, bindings):
+    def __init__(self, arch, program, num_sms, bindings, *, weight_scales=None):
         import torch
 
-        module, record = load_program(arch, program, num_sms)
+        module, record = load_program(
+            arch, program, num_sms, weight_scales=weight_scales
+        )
         self.bindings = dict(bindings)
         grid = self.bindings.pop("grid")
         self.bindings.update(grid_x=grid[0], grid_y=grid[1], grid_z=grid[2])
@@ -150,6 +200,7 @@ class V3Plan:
         reset_buffers=(),
         preparation=(),
         owners=(),
+        weight_scales=None,
     ):
         import torch
 
@@ -162,6 +213,7 @@ class V3Plan:
         self.arch = _route_arch(route, t.device)
         self.num_sms = route["num_sms"][self.arch]
         self.route, self.outputs = route, outputs
+        self.weight_scales = weight_scales
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         # Declared per architecture by the exported catalog route; absent means
         # the original host-reset lifecycle.
@@ -172,6 +224,7 @@ class V3Plan:
                 stage_program(s, self.arch),
                 self.num_sms,
                 stage_bindings[s["name"]],
+                weight_scales=weight_scales,
             )
             for s in route["stages"]
         }
@@ -179,7 +232,7 @@ class V3Plan:
         self.stages = tuple(
             stage for name, stage in stages.items() if name not in preparation
         )
-        self.owners = owners
+        self.owners = owners if weight_scales is None else (*owners, weight_scales)
         if torch.cuda.is_current_stream_capturing() and (
             self.self_cleaning or self.preparation_stages
         ):
@@ -192,7 +245,10 @@ class V3Plan:
             )
         if self.self_cleaning:
             self._zero_workspace()
-        self.update_scales()
+        if weight_scales is None:
+            self.update_scales()
+        elif self.preparation_stages:
+            raise ValueError("immutable compressed scales cannot have update stages")
 
     def _zero_workspace(self):
         if self.reset_storage is not None:
@@ -213,6 +269,10 @@ class V3Plan:
     def update_scales(self):
         """Re-run the route's preparation stages (grouped L2: the scale repack)
         after the caller changed the natural-layout scale words in place."""
+        if self.weight_scales is not None:
+            raise RuntimeError(
+                "compressed scale operands are immutable; prepare and bind another operand"
+            )
         for stage in self.preparation_stages:
             stage.run()
 
@@ -237,6 +297,7 @@ def bind_prepared(
     reset_buffers=(),
     preparation=(),
     owners=(),
+    weight_scales=None,
 ):
     """Bind explicit packed tensors to a catalog route with its original lifecycle.
 
@@ -256,7 +317,22 @@ def bind_prepared(
         if isinstance(v, torch.Tensor)
     )
     arch = device_arch(t.device)
-    route = _route(arch, surface, args)
+    if weight_scales is not None:
+        from .scales import PreparedCsfScales
+
+        if not isinstance(weight_scales, PreparedCsfScales):
+            raise TypeError("bind_prepared requires filled PreparedCsfScales")
+        weight_scales.buffers.validate(
+            weight_scales.spec, weight_scales.raw_tiles, require_cuda=True
+        )
+    route = _route(arch, surface, args, weight_scales=weight_scales)
+    if weight_scales is not None:
+        if preparation:
+            raise ValueError("immutable compressed scales cannot have update stages")
+        stage_bindings = {
+            name: weight_scales.stage_bindings(values)
+            for name, values in stage_bindings.items()
+        }
     main = stage_bindings[route["stages"][-1]["name"]]
     if tuple(main["grid"]) != tuple(route["grid"][arch]):
         raise ValueError("No exported scheduling specialization for this prepared grid")
@@ -268,6 +344,7 @@ def bind_prepared(
         reset_buffers=reset_buffers,
         preparation=preparation,
         owners=owners,
+        weight_scales=weight_scales,
     )
 
 
