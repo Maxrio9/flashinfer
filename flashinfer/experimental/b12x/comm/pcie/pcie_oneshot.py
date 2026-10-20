@@ -679,6 +679,14 @@ def _exchange_setup_failures(
     return tuple(statuses)
 
 
+def _visible_sm_count(device: torch.device) -> int:
+    """Return the device SM count with the test-only slice limit applied."""
+
+    visible_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    test_visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
+    return min(visible_sms, test_visible_sms) if test_visible_sms > 0 else visible_sms
+
+
 def _require_full_grid_residency(
     *,
     owner: str,
@@ -699,12 +707,7 @@ def _require_full_grid_residency(
     local_error: BaseException | None = None
     visible_sms = 0
     try:
-        visible_sms = int(
-            torch.cuda.get_device_properties(device).multi_processor_count
-        )
-        test_visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
-        if test_visible_sms > 0:
-            visible_sms = min(visible_sms, test_visible_sms)
+        visible_sms = _visible_sm_count(device)
         if visible_sms < required_sms:
             raise RuntimeError(
                 f"{owner} requires at least {required_sms} visible SMs so every "

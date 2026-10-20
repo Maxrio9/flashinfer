@@ -173,6 +173,7 @@ class PCIeTwoShotBF16:
         device: torch.device | int | str,
         max_rows: int,
         row_elems: int,
+        ipc: Optional[CudaRTLibrary] = None,
     ) -> "PCIeTwoShotBF16":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
@@ -208,7 +209,7 @@ class PCIeTwoShotBF16:
         )
 
         def prepare():
-            prepared_ipc = CudaRTLibrary()
+            prepared_ipc = CudaRTLibrary() if ipc is None else ipc
             prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
             return prepared_ipc, _make_layout(max_rows, row_elems, world_size)
 
@@ -335,9 +336,12 @@ class PCIeTwoShotBF16:
     # ---- graph plumbing ---------------------------------------------------
 
     @contextmanager
-    def capture(self, *, plan: Plan):
-        state = require_prepared(plan, "comm.pcie", self.device)
-        state.require_runtime(self)
+    def capture(self, *, plan: Optional[Plan] = None):
+        # A manager can capture several prepared shapes on this serial channel.
+        # Each launch still checks its plan's runtime and immutable geometry.
+        if plan is not None:
+            state = require_prepared(plan, "comm.pcie", self.device)
+            state.require_runtime(self)
         if self._capture_context_depth:
             raise RuntimeError(
                 "overlapping PCIe twoshot-bf16 capture contexts are not allowed"
