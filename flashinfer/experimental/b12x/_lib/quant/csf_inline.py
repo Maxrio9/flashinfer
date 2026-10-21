@@ -8,6 +8,7 @@ from b12x._lib.intrinsics.packed import byte_perm
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
+    st_shared_u8,
     st_shared_v4_u32,
 )
 from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
@@ -60,6 +61,81 @@ class CsfInlineReader:
                 group = ld_shared_u32(target.toint().to(Int32) + Int32(500)).to(Int32)
                 self.expand_compressed(storage, group, target, lane)
                 self.pad_rows(group, target, lane)
+
+    @cute.jit
+    def expand_warp_rows(self, storage, slot, rows, warp, lane):
+        """Rebuild one warp's 32 rows of a staged row-major slot into ``rows``.
+
+        Each lane reconstructs one row's scale word from the staged codes and bases;
+        the warp then applies the slot's exception records that fall in its rows. Only
+        the reconstructing warp reads its rows, so a warp barrier publishes them and the
+        staged slot is left unchanged.
+        """
+        assert self.plane.destination == 3 and self.plane.storage.bits == 1
+        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
+        group = ld_shared_u32(slot + Int32(500)).to(Int32)
+        source_group = group % Int32(self.plane.storage.groups)
+        nr = cutlass.min(
+            Int32(128),
+            Int32(self.plane.storage.rows)
+            - source_group // Int32(self.plane.storage.column_groups) * Int32(128),
+        )
+        nc = cutlass.min(
+            Int32(4),
+            Int32(self.plane.columns)
+            - source_group % Int32(self.plane.storage.column_groups) * Int32(4),
+        )
+        row = warp * Int32(32) + lane
+        word = Uint32(0)
+        if row < nr:
+            field = row * nc
+            shift = field % Int32(32)
+            codes = ld_shared_u32(slot + field // Int32(32) * Int32(4)) >> shift.to(Uint32)
+            if shift + nc > Int32(32):
+                codes |= ld_shared_u32(
+                    slot + field // Int32(32) * Int32(4) + Int32(4)
+                ) << (Int32(32) - shift).to(Uint32)
+            codes &= (Uint32(1) << nc.to(Uint32)) - Uint32(1)
+            codes = (codes | (codes << Uint32(14))) & Uint32(0x00030003)
+            codes = (codes | (codes << Uint32(7))) & Uint32(0x01010101)
+            base = (
+                ld_shared_u32(slot + Int32(256) + row // Int32(4) * Int32(4))
+                >> ((row % Int32(4)) * Int32(8)).to(Uint32)
+            ) & Uint32(255)
+            word = base * (
+                Uint32(0x01010101) >> ((Int32(4) - nc) * Int32(8)).to(Uint32)
+            ) + codes
+        st_shared_u32(rows + row * Int32(4), word)
+        cute.arch.sync_warp()
+        first = ld_shared_u32(slot + Int32(384))
+        end = ld_shared_u32(slot + Int32(388))
+        if first + lane.to(Uint32) < end:
+            p = (first & Uint32(1)).to(Int32) + lane
+            position = (
+                (
+                    ld_shared_u32(slot + Int32(392) + p // Int32(2) * Int32(4))
+                    >> ((p % Int32(2)) * Int32(16)).to(Uint32)
+                )
+                & Uint32(65535)
+            ).to(Int32)
+            v = ld_shared_u32(slot + Int32(496)).to(Int32) + lane
+            value = (
+                ld_shared_u32(slot + Int32(460) + v // Int32(4) * Int32(4))
+                >> ((v % Int32(4)) * Int32(8)).to(Uint32)
+            ) & Uint32(255)
+            if position // nc // Int32(32) == warp:
+                st_shared_u8(
+                    rows + position // nc * Int32(4) + position % nc,
+                    value.to(cutlass.Uint8),
+                )
+        value_offset = self.plane.group_value_offset(storage)
+        entry = first + Uint32(32) + lane.to(Uint32)
+        while entry < end:
+            position, value = self.plane.load_group_record(storage, entry, value_offset)
+            if position // nc // Int32(32) == warp:
+                st_shared_u8(rows + position // nc * Int32(4) + position % nc, value)
+            entry += Uint32(32)
+        cute.arch.sync_warp()
 
     @cute.jit
     def stage_compressed(self, storage, expert, group, target, lane, bounds=None):

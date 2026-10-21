@@ -130,6 +130,11 @@ class W4A8MaterializedPhase2Kernel:
             if not self.trellis_direct_lut:
                 self.shared_words = (self.shared_bytes + 4096 + 3) // 4
 
+    @property
+    def _region_words(self):
+        # Inline CSF rebuilds each warp's scale rows outside the staged slots.
+        return self.shared_words + (128 if self.csf_inline else 0)
+
     @cute.jit
     def __call__(
         self,
@@ -608,15 +613,14 @@ class W4A8MaterializedPhase2Kernel:
             cute.arch.cp_async_wait_group(self.stages - 1)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
+            sfb_words = sfb_base
             if cutlass.const_expr(self.csf_inline):
-                self.csf_reader.expand_slots(
-                    down_sfb_rp.iterator,
-                    sfb_base,
-                    tid,
-                    self.threads_per_cta,
-                    self.tile_n // 128,
+                # Each warp rebuilds the 32 scale rows that its N fragments read.
+                assert self.tile_n == 128 and self.num_warps == 4
+                sfb_words = smem_base + Int32(self.shared_words * 4)
+                self.csf_reader.expand_warp_rows(
+                    down_sfb_rp.iterator, sfb_base, sfb_words, warp_idx, lane
                 )
-                cute.arch.sync_threads()
             asc = cute.make_rmem_tensor((m_blocks,), Uint32)
             for blk in cutlass.range_constexpr(m_blocks):
                 if cutlass.const_expr(self.direct_routes):
@@ -710,7 +714,7 @@ class W4A8MaterializedPhase2Kernel:
                         sfb_word = Uint32(0x7F7F7F7F)
                         if cutlass.const_expr(not self.w4a8_trellis):
                             sfb_word = ld_shared_u32(
-                                sfb_base + ((n8 * Int32(8) + q) << Int32(2))
+                                sfb_words + ((n8 * Int32(8) + q) << Int32(2))
                             )
                         for blk in cutlass.range_constexpr(m_blocks):
                             fragment = facc[blk][nt]
@@ -881,7 +885,7 @@ class W4A8MaterializedPhase2Kernel:
         class Storage:
             words: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Uint32, self.shared_words * self.fused_groups
+                    cutlass.Uint32, self._region_words * self.fused_groups
                 ],
                 1024,
             ]
@@ -948,7 +952,7 @@ class W4A8MaterializedPhase2Kernel:
                         down_alpha,
                         global_scale,
                         trellis_lut,
-                        smem_base + group * Int32(self.shared_words * 4),
+                        smem_base + group * Int32(self._region_words * 4),
                         local_tid,
                         local_warp,
                         safe_pair,
