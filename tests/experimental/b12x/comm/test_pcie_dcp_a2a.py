@@ -264,7 +264,7 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         (
             kernels._get_compiled_all_gather_heads,
             "comm.pcie.dcp_a2a.all_gather_heads",
-            13,
+            14,
         ),
     )
     for launcher, identity, version in identities:
@@ -469,19 +469,20 @@ def test_lse_launch_preserves_native_launch_bounds_contract() -> None:
     assert "min_blocks_per_mp=1," in source
 
 
-def test_all_gather_resolves_one_peer_address_before_each_copy() -> None:
-    """The peer selector must not clone the memory transaction per rank."""
+def test_all_gather_pushes_segments_and_reads_only_local_memory() -> None:
+    """Ranks push segments into peers' staging; the read phase uses only local memory."""
 
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
     kernel_source = inspect.getsource(kernels._AllGatherHeadsLaunch.kernel)
-    read_phase = kernel_source.split("block_pair_barrier(", maxsplit=1)[1]
+    write_phase, read_phase = kernel_source.split("block_pair_barrier(", maxsplit=1)
+    assert "for peer in cutlass.range_constexpr(self._world_size):" in write_phase
+    assert "self._staging_words(staging[peer]) + staged_pack" in write_phase
+    assert "staging[" not in read_phase
     assert "for source in cutlass.range_constexpr(self._world_size):" in read_phase
     assert "if source_rank == Int32(source):" in read_phase
-    assert "if cutlass.const_expr(source == self._rank):" in read_phase
-    assert "source_words = local_input" in read_phase
-    assert "source_words = self._staging_words(staging[source])" in read_phase
-    assert "source_address = Int64(" in read_phase
+    assert "if cutlass.const_expr(source != self._rank):" in read_phase
+    assert "own_stage + staged_pack" in read_phase
     assert "_copy_16b_addr(" in read_phase
     assert "source_words = cute.make_ptr(" not in read_phase
 

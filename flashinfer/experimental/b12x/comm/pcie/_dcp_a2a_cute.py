@@ -1001,13 +1001,12 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
         tiles_per_rank = (local_packs + Int32(31)) // Int32(32)
         tiles_per_batch = tiles_per_rank * Int32(self._world_size)
         tiles = batch * tiles_per_batch
-        # Two ranks push each rank's segments into the peer's staging, where the
-        # peer reads them from its own memory after the barrier: PCIe carries
-        # posted writes instead of reads. Wider worlds stage locally and pull.
-        if cutlass.const_expr(self._world_size == 2):
-            local_stage = self._staging_words(staging[1 - self._rank])
-        else:
-            local_stage = self._staging_words(staging[self._rank])
+        # Every rank pushes its segments into each peer's staging and reads only
+        # its own memory after the barrier, so PCIe carries posted writes and no
+        # peer reads. Staging holds the peers' segments in rank order without the
+        # receiver's own.
+        own_stage = self._staging_words(staging[self._rank])
+        peers = Int64(self._world_size - 1)
 
         # Assign complete 512-byte segments to warps, independently of head
         # boundaries. Each rank stages and reads the same CTA's segments.
@@ -1020,10 +1019,16 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             pack = rank_tile * Int32(32) + lane
             if source_rank == Int32(self._rank) and pack < local_packs:
                 source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
-                _copy_16b(
-                    local_input + source_pack * Int64(4),
-                    local_stage + source_pack * Int64(4),
-                )
+                for peer in cutlass.range_constexpr(self._world_size):
+                    if cutlass.const_expr(peer != self._rank):
+                        staged_pack = (
+                            Int64(batch_index) * peers
+                            + Int64(self._rank if self._rank < peer else self._rank - 1)
+                        ) * Int64(local_packs) + Int64(pack)
+                        _copy_16b(
+                            local_input + source_pack * Int64(4),
+                            self._staging_words(staging[peer]) + staged_pack * Int64(4),
+                        )
             tile += warp_stride
 
         block_pair_barrier(
@@ -1033,11 +1038,10 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
         )
-        if cutlass.const_expr(self._world_size == 2):
-            # Acquire the peer's pushed segments before reading them locally.
-            if Int32(tidx) == Int32(0):
-                _membar_sys()
-            cute.arch.sync_threads()
+        # Acquire the peers' pushed segments before reading them locally.
+        if Int32(tidx) == Int32(0):
+            _membar_sys()
+        cute.arch.sync_threads()
 
         tile = warp_first
         while tile < tiles:
@@ -1054,15 +1058,14 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 source_address = Int64((local_input + source_pack * Int64(4)).toint())
                 for source in cutlass.range_constexpr(self._world_size):
                     if source_rank == Int32(source):
-                        if cutlass.const_expr(source == self._rank):
-                            source_words = local_input
-                        elif cutlass.const_expr(self._world_size == 2):
-                            source_words = self._staging_words(staging[self._rank])
-                        else:
-                            source_words = self._staging_words(staging[source])
-                        source_address = Int64(
-                            (source_words + source_pack * Int64(4)).toint()
-                        )
+                        if cutlass.const_expr(source != self._rank):
+                            staged_pack = (
+                                Int64(batch_index) * peers
+                                + Int64(source if source < self._rank else source - 1)
+                            ) * Int64(local_packs) + Int64(pack)
+                            source_address = Int64(
+                                (own_stage + staged_pack * Int64(4)).toint()
+                            )
                 _copy_16b_addr(
                     source_address,
                     Int64((output + output_pack * Int64(4)).toint()),
@@ -1961,7 +1964,7 @@ def _get_compiled_all_gather_heads(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            13,
+            14,
             key,
             labels=(
                 "world_size",
