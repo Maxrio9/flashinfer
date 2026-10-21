@@ -154,6 +154,10 @@ class PCIeTwoShotBF16:
         self._pack_stride = int(pack_stride)
         self._reduced_offset = int(reduced_offset)
         self._slot_bytes = int(slot_bytes)
+        # The all-reduce's reduce-scatter result; all-reduces on this serial channel reuse it.
+        self._push_shard = torch.empty(
+            (max_rows // world_size, row_elems), dtype=torch.bfloat16, device=self.device
+        )
         self._slot = 0
         self._device_slot_selection = False
         self._device_slot_bias = 0
@@ -377,30 +381,22 @@ class PCIeTwoShotBF16:
         if capturing and not self._device_slot_selection:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
-        if self._device_slot_selection:
-            slot = 0
-        else:
-            slot = self._slot % 2
-            self._slot += 1
-        launcher = state.launcher(self._device_slot_selection, self._device_slot_bias)
         if operation == "all_reduce":
-            launcher(
-                payload.data_ptr(),
-                self._staging_ptrs[slot],
-                self._signal_ptrs,
-                out.data_ptr(),
-                self.rank,
-                self._reduced_offset,
-                self._slot_bytes,
-                rows_per_rank,
-                blocks,
-            )
+            shard = self._push_shard[:rows_per_rank]
+            steps = (("reduce_scatter", payload, shard), ("all_gather", shard, out))
         else:
-            launcher(
-                payload.data_ptr(),
+            steps = ((operation, payload, out),)
+        for name, source, destination in steps:
+            if self._device_slot_selection:
+                slot = 0
+            else:
+                slot = self._slot % 2
+                self._slot += 1
+            state.launcher(self._device_slot_selection, self._device_slot_bias, name)(
+                source.data_ptr(),
                 self._staging_ptrs[slot],
                 self._signal_ptrs,
-                out.data_ptr(),
+                destination.data_ptr(),
                 self.rank,
                 self._pack_stride,
                 self._slot_bytes,

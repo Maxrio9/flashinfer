@@ -58,21 +58,29 @@ def test_prepared_all_reduce_counts_native_rows(monkeypatch, shape) -> None:
         _slot=0,
         _staging_ptrs=((1, 2, 3, 4), (5, 6, 7, 8)),
         _signal_ptrs=(9, 10, 11, 12),
+        _push_shard=torch.empty((8, 4096), dtype=torch.bfloat16),
     )
     state = SimpleNamespace(
         query=SimpleNamespace(
             call={"operation": "all_reduce", "threads": 512, "block_limit": 64}
         ),
-        launcher=lambda *_: lambda *args: launches.append(args),
+        launcher=lambda _slot_selection, _bias, operation: (
+            lambda *args: launches.append((operation, args))
+        ),
     )
     monkeypatch.setattr(twoshot_bf16, "_is_current_stream_capturing", lambda _: False)
     PCIeTwoShotBF16._launch_prepared(
         runtime, payload, None, out, state=state, threads=512, block_limit=64
     )
-    assert len(launches) == 1
-    assert launches[0][0] == payload.data_ptr()
-    assert launches[0][3] == out.data_ptr()
-    assert launches[0][-2] == 8  # 32 native rows split across four ranks.
+    # A push reduce-scatter into the channel's shard, then a push all-gather into out,
+    # on alternating staging slots.
+    shard = runtime._push_shard.data_ptr()
+    assert [operation for operation, _ in launches] == ["reduce_scatter", "all_gather"]
+    (_, scatter), (_, gather) = launches
+    assert (scatter[0], scatter[3]) == (payload.data_ptr(), shard)
+    assert (gather[0], gather[3]) == (shard, out.data_ptr())
+    assert (scatter[1], gather[1]) == ((1, 2, 3, 4), (5, 6, 7, 8))
+    assert scatter[-2] == gather[-2] == 8  # 32 native rows split across four ranks.
 
 
 def test_layout_is_tp4_only_and_scales_with_capacity() -> None:

@@ -281,39 +281,28 @@ def compile_twoshot_surface(query_payload, ordinal: int):
                 )
                 for device_slot, bias in call["device_slot_variants"]
             }
-        from ._twoshot_bf16_cute import (
-            get_twoshot_bf16_allreduce_launcher,
-            get_twoshot_bf16_launcher,
-        )
+        from ._twoshot_bf16_cute import get_twoshot_bf16_launcher
 
-        getter = (
-            get_twoshot_bf16_allreduce_launcher
+        # The BF16 all-reduce runs as a reduce-scatter followed by an all-gather on the
+        # same serialized channel. Both push their shards into peer staging, so every
+        # PCIe transfer is a posted write; no kernel waits on remote reads.
+        operations = (
+            ("reduce_scatter", "all_gather")
             if call["operation"] == "all_reduce"
-            else get_twoshot_bf16_launcher
+            else (str(call["operation"]),)
         )
         return {
-            (bool(device_slot), int(bias)): (
-                getter(
-                    query.world_size,
-                    query.rank,
-                    bool(device_slot),
-                    int(bias),
-                    int(call["threads"]),
-                    int(call["row_elems"]),
-                    int(ordinal),
-                )
-                if call["operation"] == "all_reduce"
-                else getter(
-                    str(call["operation"]),
-                    query.world_size,
-                    query.rank,
-                    bool(device_slot),
-                    int(bias),
-                    int(call["threads"]),
-                    int(call["row_elems"]),
-                    int(ordinal),
-                )
+            (operation, bool(device_slot), int(bias)): get_twoshot_bf16_launcher(
+                operation,
+                query.world_size,
+                query.rank,
+                bool(device_slot),
+                int(bias),
+                int(call["threads"]),
+                int(call["row_elems"]),
+                int(ordinal),
             )
+            for operation in operations
             for device_slot, bias in call["device_slot_variants"]
         }
 
@@ -334,9 +323,12 @@ class _TwoShotExecutionState:
         ):
             raise ValueError("two-shot runtime ABI differs from preparation")
 
-    def launcher(self, device_slot_selection: bool, slot_bias: int):
+    def launcher(self, device_slot_selection: bool, slot_bias: int, operation=None):
+        key = (bool(device_slot_selection), int(slot_bias) & 1)
+        if self.query.surface in _BF16_SURFACES:
+            key = (operation or self.query.call["operation"], *key)
         try:
-            return self.launchers[(bool(device_slot_selection), int(slot_bias) & 1)]
+            return self.launchers[key]
         except KeyError as exc:
             raise RuntimeError(
                 "two-shot prepared plan misses requested slot launcher"
