@@ -89,7 +89,7 @@ def test_serialized_tp4_bf16_factory_requires_a_resident_grid_on_every_rank(
     assert manager._runtime is runtime
     if min(rank_sms) >= 64:
         twoshot_factory.assert_called_once_with(
-            exchange_group=group, device="cuda:0", max_rows=40960, row_elems=8, ipc=ipc
+            exchange_group=group, device="cuda:0", max_rows=131072, row_elems=8, ipc=ipc
         )
         assert manager._bf16_twoshot is twoshot_factory.return_value
     else:

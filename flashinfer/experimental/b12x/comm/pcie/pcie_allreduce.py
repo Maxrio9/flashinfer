@@ -57,7 +57,9 @@ ISLAND_RS_MAX_BYTES = 160 * 1024
 PARTIAL_ISLAND_MAX_BYTES = 32 * 1024
 # Serialized TP4 BF16 messages above this size favor single-rounding two-shot.
 BF16_TWOSHOT_MIN_BYTES = 64 * 1024
-BF16_TWOSHOT_MAX_BYTES = 640 * 1024
+# The push two-shot stays below one-shot through verification-sized batches;
+# the cap bounds the channel's staging (two slots plus the reduce-scatter shard).
+BF16_TWOSHOT_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _algorithm_override() -> str:
@@ -115,7 +117,7 @@ class PCIeAllReduce:
     """Select a peer-safe all-reduce implementation from the world size.
 
     Worlds through TP8 use the low-latency all-peer oneshot runtime. Serialized
-    TP4 BF16 messages in the 64–640 KiB band use single-rounding two-shot
+    TP4 BF16 messages in the 64 KiB–2 MiB band use single-rounding two-shot
     when every rank has at least 64 visible SMs. TP9,
     TP10, TP12 and TP16 use islands of up to four GPUs so no context maps more than
     six peers. Other worlds fail closed instead of exceeding the CUDA peer
