@@ -224,6 +224,33 @@ def _nvfp4_a16_query(rows=1):
     )
 
 
+@pytest.mark.parametrize("rows", (4, 32, 4096))
+@pytest.mark.parametrize("capability", (False, True))
+def test_csf_inline_candidates_follow_declared_precision(rows, capability):
+    from b12x.moe.fused_moe._tuning import TUNING
+    from b12x.moe.fused_moe._preparation import _decode_query
+
+    query = replace(
+        _nvfp4_a16_query(rows),
+        w4a16_weight_layout="packed",
+        csf_inline_scales=True,
+        controls=FrozenMapping({"w4a16_a4_prefill_enabled": capability}),
+    )
+    keys = []
+    for choice in (None, False, True):
+        declared = replace(query, a4_prefill=choice)
+        encoded = TUNING.encode_query(declared)
+        assert _decode_query(encoded) == declared
+        keys.append(encoded)
+        candidates = [c for _, c in TUNING.eligible_plan(declared, DEVICE).candidates]
+        assert candidates
+        expected_inline = choice is False or (choice is None and not capability)
+        assert {c.csf_inline_scales for c in candidates} == (
+            {False, True} if expected_inline else {False}
+        )
+    assert keys[0] != keys[1] != keys[2]
+
+
 def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
     import torch
     from b12x.moe import fused_moe as moe

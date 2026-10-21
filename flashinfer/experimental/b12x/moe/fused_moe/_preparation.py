@@ -251,6 +251,7 @@ def _query(
         controls=controls,
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
         csf_inline_scales=plan.csf_inline_scales,
+        a4_prefill=invocation.get("a4_prefill"),
     )
 
 
@@ -361,6 +362,7 @@ def _lower_caps(
         w4a16_small_m_occupancy=int(query.controls.get("w4a16_small_m_occupancy", 1)),
         w4a16_a4_prefill_enabled=bool(
             query.controls.get("w4a16_a4_prefill_enabled", False)
+            and query.a4_prefill is not False
         ),
         w4a16_a4_prefill_terms=int(query.controls.get("w4a16_a4_prefill_terms", 1)),
         w4a16_a4_prefill_warps=int(query.controls.get("w4a16_a4_prefill_warps", 8)),
@@ -1160,6 +1162,14 @@ class _FusedMoeState:
     w4a16_launches: _W4A16PrimaryLaunches | None = None
     compact_launches: _CompactLaunches | None = None
     execution_experts: object | None = None
+    a4_prefill: bool | None = None
+
+    def _precision_choice(self, requested):
+        if self.a4_prefill is None:
+            return requested
+        if requested is not None and requested is not self.a4_prefill:
+            raise ValueError("a4_prefill differs from the prepared numerical contract")
+        return self.a4_prefill
 
     def _a4_launch_for(
         self,
@@ -1171,6 +1181,7 @@ class _FusedMoeState:
         collect_activation_amax,
         scales_expanded=False,
     ):
+        a4_prefill = self._precision_choice(a4_prefill)
         if self.w4a16_launches is None or not self.experts._impl.a4_prefill_scales:
             return None
         sizes = {
@@ -1200,6 +1211,7 @@ class _FusedMoeState:
         collect_activation_amax,
         scales_expanded=False,
     ) -> bool:
+        self._precision_choice(a4_prefill)
         if not 0 < int(num_tokens) <= self.scratch.caps.max_tokens:
             raise ValueError("token count exceeds prepared MoE capacity")
         decoder = self.experts._impl.nvfp4_csf
@@ -1211,6 +1223,7 @@ class _FusedMoeState:
         experts = kwargs.pop("experts", self.experts)
         if experts is not self.experts:
             raise ValueError("prepared experts differ from the plan declaration")
+        kwargs["a4_prefill"] = self._precision_choice(kwargs.get("a4_prefill"))
         if self.config.nvfp4_share_input and not self.experts._impl.can_share_input(
             input_scales_static=True
         ):
@@ -1310,6 +1323,7 @@ class _FusedMoeCapacityState:
             state = self.variants[self.a16_max_tokens]
         else:
             state = variant_for(self.variants, tokens)
+        a4_prefill = state._precision_choice(a4_prefill)
         if a4_prefill is True:
             selection = dict(
                 num_tokens=tokens,
@@ -1367,6 +1381,11 @@ def plan(
     if not isinstance(routing, RoutingSpec):
         raise TypeError("routing must be a RoutingSpec")
     invocation = FrozenMapping(invocation)
+    if (
+        invocation.get("a4_prefill") is not None
+        and type(invocation["a4_prefill"]) is not bool
+    ):
+        raise TypeError("a4_prefill must be a boolean or None")
     controls = _control_snapshot()
     cutoff = min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
     counts = tuple(
@@ -1533,6 +1552,7 @@ def plan(
                 replace(experts._impl, nvfp4_csf=scale_decoder)
                 if scale_decoder is not None
                 else experts._impl,
+                a4_prefill=query.a4_prefill,
             )
 
         return Plan(

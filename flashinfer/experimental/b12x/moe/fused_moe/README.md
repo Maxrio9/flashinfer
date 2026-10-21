@@ -33,6 +33,16 @@ The execution binding accepts `a4_prefill`:
 - `True` selects prepared A4 launches.
 - `False` or `None` selects W4A16.
 
+Session preparation can fix this choice with
+`plan_execution(invocation=FrozenMapping({"a4_prefill": False}))` for A16 or
+`True` for A4 prefill. The declared choice participates in the tuning query
+and compilation identity. Binding inherits it when the argument is omitted;
+an explicit conflicting choice is rejected. An A16 declaration can tune both
+inline CSF and scratch expansion even when the weights retain A4 capability.
+Inline is selected only when it wins the workload's tuning race. A4 declarations
+retain expanded scales. Omitting the declaration preserves per-binding precision
+selection and its conservative inline eligibility.
+
 The caller selects precision from request semantics: prefill may use A4;
 decode and speculative verification use A16. Token count does not select
 hybrid precision, and `ActivationSpec.a16_max_tokens` does not override an

@@ -51,9 +51,11 @@ class MoeDecodeQuery:
     shared_input_scales: bool = False
     csf_inline_scales: bool = False
     swiglu_clamp_after_silu: bool = False
+    a4_prefill: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "a4_prefill": self.a4_prefill,
             "activation": self.activation,
             "apply_router_weight_on_input": self.apply_router_weight_on_input,
             "collect_activation_amax": self.collect_activation_amax,
@@ -275,6 +277,8 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("query must be MoeDecodeQuery")
     if not isinstance(query.controls, FrozenMapping):
         raise TypeError("MoE controls must be frozen declaration metadata")
+    if query.a4_prefill is not None and type(query.a4_prefill) is not bool:
+        raise TypeError("a4_prefill must be a boolean or None")
     if query.controls.get("trellis_decode_table", "auto") not in {
         "auto",
         "compact",
@@ -326,7 +330,13 @@ def _csf_inline_eligible(query, config):
             and query.hidden_size % 128 == 0
             and query.intermediate_size % 64 == 0
             and query.w4a16_weight_layout == "packed"
-            and not query.controls.get("w4a16_a4_prefill_enabled", False)
+            and (
+                query.a4_prefill is False
+                or (
+                    query.a4_prefill is None
+                    and not query.controls.get("w4a16_a4_prefill_enabled", False)
+                )
+            )
         )
     tile = query.controls.get("dynamic_tile_mn")
     return bool(
@@ -927,7 +937,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=31,
+    query_schema_version=32,
     config_schema_version=26,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),

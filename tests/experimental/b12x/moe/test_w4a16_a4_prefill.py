@@ -180,6 +180,106 @@ def _bind(xp, x, ids, wts, out, scratch, **kwargs):
     )
 
 
+@pytest.mark.parametrize("tokens", (128, 4096))
+def test_declared_csf_precision_replays_after_scale_scratch_poisoning(
+    tokens, monkeypatch, tmp_path
+):
+    device = require_b12x()
+    from b12x.moe import fused_moe as moe
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    _env(monkeypatch, True, 1)
+    case = _make_case(16)
+    a1g, a2g = _scales(case)
+    experts = _prepare(case, a1g, a2g, csf=True)
+    x, ids, wts = _inputs(tokens, 24)
+    graphs, outputs, plans, bindings = {}, {}, {}, {}
+
+    def prepare(state):
+        scratch = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        output = torch.empty_like(x)
+        binding = state.bind(
+            a=x,
+            topk_ids=ids,
+            topk_weights=wts,
+            output=output,
+            scratch=scratch,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding),
+            output=output,
+            owners=(scratch, binding),
+        )
+
+    for name, a4, inline in (
+        ("a16_inline", False, True),
+        ("a16_expansion", False, False),
+        ("a4", True, False),
+    ):
+        plan = moe.plan_execution(
+            experts=experts,
+            capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=TOPK),
+            invocation={"a4_prefill": a4, "fast_math": False},
+            routing=moe.RoutingSpec(deterministic_output=True),
+            override=MoeDecodeConfig(
+                backend="w4a16",
+                route_planner="internal",
+                max_active_clusters=None,
+                w4a16_route_mode="packed",
+                csf_inline_scales=inline,
+            ),
+        )
+        with PreparationSession(
+            device=device, autotune=False, compile_workers=1, cache_dir=tmp_path
+        ) as session:
+            session.prepare((plan.request(name=name, prepare_call=prepare),))
+            call = prepare(plan.prepared.state)
+            binding = call.owners[1]
+            assert (binding.a4_prefill_launches is not None) == a4
+            assert moe.uses_expanded_nvfp4_scales(
+                plan, num_tokens=tokens, a4_prefill=a4
+            ) == (not inline)
+            with pytest.raises(ValueError, match="prepared numerical contract"):
+                plan.prepared.state.bind(a4_prefill=not a4)
+        call.run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call.run()
+        graphs[name], outputs[name] = graph, call.output
+        plans[name], bindings[name] = plan, call
+
+    expected_a4 = _emulate(case, x, ids, wts, a1g, a2g, 1)
+    for _ in range(3):
+        for name in ("a4", "a16_inline", "a16_expansion", "a16_inline"):
+            experts._impl.w1_blockscale.zero_()
+            experts._impl.w2_blockscale.zero_()
+            graphs[name].replay()
+        torch.cuda.synchronize()
+        if tokens == 128:
+            torch.testing.assert_close(
+                outputs["a16_inline"], outputs["a16_expansion"], rtol=0, atol=0
+            )
+        else:
+            # At 4096 rows, repeated runs of either W4A16 graph on this
+            # fixture vary by up to 0.0625 max-abs and 5.5e-5 RMSE. Bound
+            # cross-mode error at the same BF16 step and twice that RMSE.
+            delta = outputs["a16_inline"].float() - outputs["a16_expansion"].float()
+            assert delta.abs().max().item() <= 0.0625
+            assert delta.square().mean().sqrt().item() <= 1.1e-4
+        relative = (
+            (outputs["a4"].double() - expected_a4).norm() / expected_a4.norm()
+        ).item()
+        assert relative < 4e-3, relative
+    for graph in graphs.values():
+        graph.reset()
+
+
 def _emulate(case, x, ids, wts, a1g, a2g, terms):
     H = x.shape[-1]
     TOPK = ids.shape[-1]
