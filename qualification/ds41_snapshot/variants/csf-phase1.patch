@@ -1,0 +1,375 @@
+diff --git a/flashinfer/experimental/b12x/_lib/quant/csf_inline.py b/flashinfer/experimental/b12x/_lib/quant/csf_inline.py
+--- a/flashinfer/experimental/b12x/_lib/quant/csf_inline.py
++++ b/flashinfer/experimental/b12x/_lib/quant/csf_inline.py
+@@ -11,0 +12 @@
++    ld_global_nc_u32,
+@@ -65 +66,35 @@
+-    def stage_compressed(self, storage, expert, group, target, lane, bounds=None):
++    def prefetch_column_bounds(self, storage, expert, row_group):
++        """Keep one row group's exception bounds in warp-distributed registers."""
++        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
++        groups = self.plane.storage.column_groups
++        bounds = cute.make_rmem_tensor(
++            cute.make_layout(((groups + 31) // 32, 2)), Uint32
++        )
++        bounds.fill(Uint32(0))
++        lane = Int32(cute.arch.lane_idx())
++        for chunk in cutlass.range_constexpr((groups + 31) // 32):
++            column = lane + Int32(chunk * 32)
++            if column < Int32(groups):
++                group = row_group * Int32(groups) + column
++                first, end = self.plane.group_record_bounds(storage, expert, group)
++                bounds[chunk, 0] = first
++                bounds[chunk, 1] = end
++        return bounds
++
++    @cute.jit
++    def prefetch_row_bases(self, storage, expert, row_group, lane):
++        """Keep four adjacent row bases per producer lane across a K sweep."""
++        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
++        row = row_group * Int32(128) + lane * Int32(4)
++        word = Uint32(0)
++        if lane < Int32(32) and row < Int32(self.plane.storage.rows):
++            offset = Int64(self.plane.storage.bases) + (
++                expert * Int32(self.plane.storage.rows) + row
++            ).to(Int64)
++            word = ld_global_nc_u32((storage + offset).toint())
++        return word
++
++    @cute.jit
++    def stage_compressed(
++        self, storage, expert, group, target, lane, bounds=None, value_offset=None, base_word=None
++    ):
+@@ -92 +127,3 @@
+-        value_start = self.plane.group_value_offset(storage) + first.to(Int64)
++        if cutlass.const_expr(value_offset is None):
++            value_offset = self.plane.group_value_offset(storage)
++        value_start = value_offset + first.to(Int64)
+@@ -124,14 +161,21 @@
+-        if lane < Int32(8):
+-            if valid and lane * Int32(16) < nr:
+-                cp_async4_shared_global(
+-                    address + Int32(256) + lane * Int32(16),
+-                    (storage + bases + lane.to(Int64) * Int64(16)).toint(),
+-                )
+-            else:
+-                st_shared_v4_u32(
+-                    address + Int32(256) + lane * Int32(16),
+-                    Uint32(0),
+-                    Uint32(0),
+-                    Uint32(0),
+-                    Uint32(0),
+-                )
++        if cutlass.const_expr(base_word is not None):
++            if lane < Int32(32):
++                word = Uint32(0)
++                if valid:
++                    word = base_word
++                st_shared_u32(address + Int32(256) + lane * Int32(4), word)
++        else:
++            if lane < Int32(8):
++                if valid and lane * Int32(16) < nr:
++                    cp_async4_shared_global(
++                        address + Int32(256) + lane * Int32(16),
++                        (storage + bases + lane.to(Int64) * Int64(16)).toint(),
++                    )
++                else:
++                    st_shared_v4_u32(
++                        address + Int32(256) + lane * Int32(16),
++                        Uint32(0),
++                        Uint32(0),
++                        Uint32(0),
++                        Uint32(0),
++                    )
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py
+@@ -324,0 +325,3 @@
++        bounds=None,
++        value_offset=None,
++        base_word=None,
+@@ -335,0 +339,13 @@
++                cached = None
++                if cutlass.const_expr(bounds is not None):
++                    first, end = Uint32(0), Uint32(0)
++                    for chunk in cutlass.range_constexpr(cute.size(bounds, mode=[0])):
++                        selected_first = cute.arch.shuffle_sync(
++                            bounds[chunk, 0], k128_slice % Int32(32)
++                        )
++                        selected_end = cute.arch.shuffle_sync(
++                            bounds[chunk, 1], k128_slice % Int32(32)
++                        )
++                        if k128_slice // Int32(32) == Int32(chunk):
++                            first, end = selected_first, selected_end
++                    cached = (first, end)
+@@ -337 +353 @@
+-                    scales.iterator, expert_idx, group, target, tid
++                    scales.iterator, expert_idx, group, target, tid, cached, value_offset, base_word
+@@ -395,0 +412,5 @@
++        gate_bounds=None,
++        up_bounds=None,
++        csf_value_offset=None,
++        gate_base_word=None,
++        up_base_word=None,
+@@ -537,0 +559,3 @@
++                    gate_bounds,
++                    csf_value_offset,
++                    gate_base_word,
+@@ -548,0 +573,3 @@
++                    up_bounds,
++                    csf_value_offset,
++                    up_base_word,
+@@ -647,0 +675,26 @@
++        gate_bounds, up_bounds = None, None
++        gate_base_word, up_base_word = None, None
++        csf_value_offset = None
++        if cutlass.const_expr(self.csf_inline):
++            # A task holds its expert and output row group across the K sweep.
++            # Fetch each column group's dependent global bounds once, then
++            # select fixed register fields through producer-warp shuffles.
++            section_expert = expert_idx * Int32(self.csf_reader.plane.sections)
++            # The exception value plane is shared by every expert and K tile.
++            csf_value_offset = self.csf_reader.plane.group_value_offset(
++                w13_sfb_rp.iterator
++            )
++            gate_bounds = self.csf_reader.prefetch_column_bounds(
++                w13_sfb_rp.iterator, section_expert + Int32(1), output_tile
++            )
++            up_bounds = self.csf_reader.prefetch_column_bounds(
++                w13_sfb_rp.iterator, section_expert, output_tile
++            )
++            # Row bases are invariant across the column groups staged by a task.
++            gate_base_word = self.csf_reader.prefetch_row_bases(
++                w13_sfb_rp.iterator, section_expert + Int32(1), output_tile, tid
++            )
++            up_base_word = self.csf_reader.prefetch_row_bases(
++                w13_sfb_rp.iterator, section_expert, output_tile, tid
++            )
++
+@@ -668,0 +722,5 @@
++                    gate_bounds,
++                    up_bounds,
++                    csf_value_offset,
++                    gate_base_word,
++                    up_base_word,
+@@ -729,0 +788,5 @@
++                    gate_bounds,
++                    up_bounds,
++                    csf_value_offset,
++                    gate_base_word,
++                    up_base_word,
+diff --git a/tests/experimental/b12x/quantization/test_csf_column_bounds.py b/tests/experimental/b12x/quantization/test_csf_column_bounds.py
+new file mode 100644
+--- /dev/null
++++ b/tests/experimental/b12x/quantization/test_csf_column_bounds.py
+@@ -0,0 +1,210 @@
++"""Prefetched bounds and row bases preserve CPU offsets and decoded scale bytes."""
++import cutlass
++import cutlass.cute as cute
++import cutlass.utils
++import pytest
++import numpy as np
++import torch
++from cutlass.cutlass_dsl import Int32, Uint32
++
++from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
++from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane, upload_csf_block_payload
++from b12x._lib.quant.csf_inline import CsfInlineReader
++from b12x._lib.utils.device import current_cuda_stream
++from b12x._lib.utils.pointers import make_ptr
++from .test_csf_blocks import planes_and_native
++from .test_csf_native_preparation import logical_grid
++from ..conftest import require_b12x
++
++
++class ReadColumnBounds:
++    def __init__(self, geometry, prefetched, decode):
++        self.reader = CsfInlineReader(geometry)
++        self.prefetched = prefetched
++        self.decode = decode
++        self.row_groups = (self.reader.plane.storage.rows + 127) // 128
++        self.blocks = self.reader.plane.storage.experts * self.row_groups
++
++    @cute.jit
++    def __call__(self, source: cute.Pointer, output: cute.Pointer,
++                 observed: cute.Pointer, poison: cute.Pointer, stream):
++        self.kernel(source, output, observed, poison).launch(
++            grid=(self.blocks, 1, 1), block=(32, 1, 1), stream=stream)
++
++    @cute.kernel
++    def kernel(self, source, output, observed, poison):
++        lane, _, _ = cute.arch.thread_idx()
++        block, _, _ = cute.arch.block_idx()
++        source_expert = Int32(block) // Int32(self.row_groups)
++        row_group = Int32(block) % Int32(self.row_groups)
++        columns = self.reader.plane.storage.column_groups
++        groups = self.reader.plane.storage.groups
++        sections = self.reader.plane.sections
++        expert = source_expert // Int32(sections)
++        section = source_expert % Int32(sections)
++        base_word = self.reader.prefetch_row_bases(source, source_expert, row_group, Int32(lane))
++        bases_out = cute.make_tensor(observed, cute.make_layout(self.blocks * columns * 4 + self.blocks * 32))
++        bases_out[self.blocks * columns * 4 + Int32(block) * 32 + Int32(lane)] = base_word.to(Int32)
++        cached_bounds = None
++        if cutlass.const_expr(self.prefetched):
++            cached_bounds = self.reader.prefetch_column_bounds(
++                source, source_expert, row_group)
++        shared = cutlass.utils.SmemAllocator().allocate_tensor(
++            Uint32, cute.make_layout(128), byte_alignment=16)
++        target = cute.recast_ptr(shared.iterator, dtype=cutlass.Uint8)
++        poison_value = cute.make_tensor(poison, cute.make_layout(1))[0]
++        for column in range(columns):
++            # Reuse one staging slot across column groups and graph replays.
++            for i in cutlass.range_constexpr(4):
++                shared[Int32(lane) + Int32(i * 32)] = poison_value
++            cute.arch.sync_warp()
++            local_group = row_group * Int32(columns) + Int32(column)
++            group = section * Int32(groups) + local_group
++            direct_first, direct_end = self.reader.plane.group_record_bounds(
++                source, source_expert, local_group)
++            first, end = direct_first, direct_end
++            if cutlass.const_expr(self.prefetched):
++                first, end = Uint32(0), Uint32(0)
++                for chunk in cutlass.range_constexpr(cute.size(cached_bounds, mode=[0])):
++                    selected_first = cute.arch.shuffle_sync(
++                        cached_bounds[chunk, 0], Int32(column) % Int32(32))
++                    selected_end = cute.arch.shuffle_sync(
++                        cached_bounds[chunk, 1], Int32(column) % Int32(32))
++                    if Int32(column) // Int32(32) == Int32(chunk):
++                        first, end = selected_first, selected_end
++            index = Int32(block) * Int32(columns) + Int32(column)
++            if lane == 0:
++                bounds_out = cute.make_tensor(observed, cute.make_layout(self.blocks * columns * 4))
++                bounds_out[index * 4] = direct_first
++                bounds_out[index * 4 + 1] = direct_end
++                bounds_out[index * 4 + 2] = first
++                bounds_out[index * 4 + 3] = end
++            if cutlass.const_expr(self.decode):
++                if cutlass.const_expr(self.prefetched):
++                    self.reader.stage_compressed(source, expert, group, target, Int32(lane), (first, end), None, base_word)
++                else:
++                    self.reader.stage_compressed(source, expert, group, target, Int32(lane))
++                cute.arch.cp_async_commit_group()
++                cute.arch.cp_async_wait_group(0)
++                cute.arch.sync_warp()
++                self.reader.expand_compressed(source, group, target, Int32(lane))
++                nr = cutlass.min(Int32(128), Int32(self.reader.plane.storage.rows) - row_group * 128)
++                nc = cutlass.min(Int32(4), Int32(self.reader.plane.columns) - Int32(column) * 4)
++                out = cute.make_tensor(cute.recast_ptr(output, dtype=Uint32),
++                                       cute.make_layout(self.blocks * columns * 128))
++                for quarter in cutlass.range_constexpr(4):
++                    position = Int32(lane) * 16 + Int32(quarter * 4)
++                    if position < nr * nc:
++                        out[index * 128 + position // 4] = shared[position // 4]
++                cute.arch.sync_warp()
++
++
++def _exercise(quantization, rows, columns, sections, exceptions, decode):
++    device = require_b12x()
++    planes, native = planes_and_native(rows, columns, 2, quantization=quantization,
++        dense=exceptions == "dense", empty=exceptions == "empty")
++    logical = logical_grid(native, rows, columns)
++    payload = upload_csf_block_payload(planes, device, native_codes=True,
++        group_record_bytes=3, destination=3, group_rows=rows // sections)
++    plane = Nvfp4CompactBlockPlane(payload)
++    # The asynchronous slot decoder requires aligned expert code planes.
++    assert plane.scales.geometry.code_bytes % 16 == 0
++    row_groups = (rows // sections + 127) // 128
++    column_groups = (columns + 3) // 4
++    count = 2 * sections * row_groups * column_groups
++    expected = torch.full((count, 512), 0xD3, dtype=torch.uint8)
++    index = 0
++    for expert in range(2):
++        for section in range(sections):
++            for r in range(row_groups):
++                nr = min(128, rows // sections - r * 128)
++                for c in range(column_groups):
++                    nc = min(4, columns - c * 4)
++                    values = logical[expert, section * (rows // sections) + r * 128:
++                        section * (rows // sections) + r * 128 + nr, c * 4:c * 4 + nc]
++                    expected[index, :nr * nc] = values.reshape(-1)
++                    index += 1
++    outputs = [torch.empty_like(expected, device=device) for _ in range(2)]
++    observed = [torch.empty(count * 4 + 2 * sections * row_groups * 32, dtype=torch.int32, device=device) for _ in range(2)]
++    poison = torch.zeros(1, dtype=torch.int32, device=device)
++    source_before = payload.storage.clone()
++    # Independently read the serialized CPU page-base/prefix tables. Their
++    # terminal prefix per 32-group page is part of the storage contract.
++    layout = plane.scales.geometry
++    raw = source_before.cpu().numpy()
++    pages = np.frombuffer(raw, dtype="<u4", count=layout.experts * layout.pages,
++                          offset=layout.page_bases).reshape(layout.experts, layout.pages)
++    prefixes = np.frombuffer(raw, dtype="<u2", count=layout.experts * layout.prefixes,
++                             offset=layout.offsets).reshape(layout.experts, layout.prefixes)
++    cpu_bounds = []
++    for expert in range(layout.experts):
++        for group in range(layout.groups):
++            page = group // 32
++            prefix = group + page
++            first = int(pages[expert, page]) + int(prefixes[expert, prefix])
++            end = int(pages[expert, page]) + int(prefixes[expert, prefix + 1])
++            cpu_bounds.append((first, end, first, end))
++    cpu_bounds = torch.tensor(cpu_bounds, dtype=torch.int32).reshape(-1)
++    base_bytes = raw[layout.bases:layout.bases + layout.experts * layout.rows].reshape(layout.experts, layout.rows)
++    cpu_bases = np.zeros((layout.experts, row_groups, 128), dtype=np.uint8)
++    for expert in range(layout.experts):
++        for group in range(row_groups):
++            nr = min(128, layout.rows - group * 128)
++            cpu_bases[expert, group, :nr] = base_bytes[expert, group * 128:group * 128 + nr]
++    cpu_observed = torch.cat((cpu_bounds, torch.from_numpy(cpu_bases.reshape(-1).view(np.int32)).clone()))
++    ptr = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
++    i32ptr = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
++    programs = [b12x_compile(ReadColumnBounds(plane.geometry, cached, decode), ptr, ptr, i32ptr, i32ptr,
++        current_cuda_stream(), compile_spec=KernelCompileSpec.from_key(
++            "test.csf_column_bounds_and_row_bases", 1, (plane.geometry, cached, decode))) for cached in (False, True)]
++    source = make_ptr(cutlass.Uint8, payload.storage.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
++    control = make_ptr(cutlass.Int32, poison.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
++    graphs = []
++    try:
++        for program, out, bounds in zip(programs, outputs, observed, strict=True):
++            args = (source, make_ptr(cutlass.Uint8, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
++                    make_ptr(cutlass.Int32, bounds.data_ptr(), cute.AddressSpace.gmem, assumed_align=16), control,
++                    )
++            program(*args, current_cuda_stream())
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph):program(*args, current_cuda_stream())
++            graphs.append(graph)
++        torch.cuda.synchronize()
++        allocated = torch.cuda.memory_allocated()
++        for value in (0x12345678, -1, 0):
++            poison.fill_(value)
++            for graph, out, bounds in zip(graphs, outputs, observed, strict=True):
++                out.fill_(0xD3);bounds.fill_(-1);graph.replay()
++            torch.cuda.synchronize()
++            assert torch.equal(outputs[0], outputs[1])
++            assert torch.equal(observed[0], observed[1])
++            for out, bounds in zip(outputs, observed, strict=True):
++                assert torch.equal(bounds.cpu(), cpu_observed)
++                if decode:
++                    assert torch.equal(out.cpu(), expected)
++                assert torch.equal(bounds[:count * 4].reshape(count, 4)[:, :2], bounds[:count * 4].reshape(count, 4)[:, 2:])
++            assert torch.equal(payload.storage, source_before)
++            assert torch.cuda.memory_allocated() == allocated
++    finally:
++        for graph in graphs:graph.reset()
++
++
++@pytest.mark.parametrize("quantization", ["mxfp4", "nvfp4"])
++@pytest.mark.parametrize("rows,columns,sections", [
++    (128, 4, 1), (384, 130, 2), (512, 131, 2), (512, 161, 2), (1152, 160, 2)])
++@pytest.mark.parametrize("exceptions", ["empty", "sparse", "dense"])
++def test_prefetched_column_bounds_and_cpu_bytes(quantization, rows, columns, sections, exceptions):
++    # W4A8 K64-native operands have two/four scale columns per final group.
++    # Odd-column cases qualify the generic bounds helper independently of the
++    # shared decoder's two/four-column consumer restriction.
++    _exercise(quantization, rows, columns, sections, exceptions, columns % 2 == 0)
++
++
++@pytest.mark.parametrize("quantization", ["mxfp4", "nvfp4"])
++@pytest.mark.parametrize("columns", [131, 161])
++@pytest.mark.xfail(strict=True, raises=AssertionError,
++    reason="Shared destination3 decoder assumes two/four scale columns; qualify odd tails after its base-byte mapping is generalized")
++def test_shared_decoder_odd_tail_cpu_bytes(quantization, columns):
++    # Keep the independent byte invariant visible; do not certify odd-tail
++    # decoding merely because prefetched and ordinary consumers agree.
++    _exercise(quantization, 512, columns, 2, "empty", True)

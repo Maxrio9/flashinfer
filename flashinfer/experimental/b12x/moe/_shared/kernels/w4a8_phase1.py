@@ -322,6 +322,9 @@ class W4A8MaterializedPhase1Kernel:
         intermediate_tiles: Int32,
         total_k32: cutlass.Constexpr,
         tid: Int32,
+        bounds=None,
+        value_offset=None,
+        base_word=None,
     ):
         if cutlass.const_expr(self.csf_inline):
             if tid < Int32(32):
@@ -333,8 +336,21 @@ class W4A8MaterializedPhase1Kernel:
                 target = cute.make_ptr(
                     cutlass.Uint8, dst_base, cute.AddressSpace.smem, assumed_align=16
                 )
+                cached = None
+                if cutlass.const_expr(bounds is not None):
+                    first, end = Uint32(0), Uint32(0)
+                    for chunk in cutlass.range_constexpr(cute.size(bounds, mode=[0])):
+                        selected_first = cute.arch.shuffle_sync(
+                            bounds[chunk, 0], k128_slice % Int32(32)
+                        )
+                        selected_end = cute.arch.shuffle_sync(
+                            bounds[chunk, 1], k128_slice % Int32(32)
+                        )
+                        if k128_slice // Int32(32) == Int32(chunk):
+                            first, end = selected_first, selected_end
+                    cached = (first, end)
                 self.csf_reader.stage_compressed(
-                    scales.iterator, expert_idx, group, target, tid
+                    scales.iterator, expert_idx, group, target, tid, cached, value_offset, base_word
                 )
         logical_n = intermediate_tiles * Int32(128)
         if cutlass.const_expr(self.n64_tail):
@@ -393,6 +409,11 @@ class W4A8MaterializedPhase1Kernel:
         input_k128_tiles: Int32,
         intermediate_tiles: Int32,
         packed_w13_tiles: Int32,
+        gate_bounds=None,
+        up_bounds=None,
+        csf_value_offset=None,
+        gate_base_word=None,
+        up_base_word=None,
     ):
         stage = k64_slice & Int32(self.stages - 1)
         stage_base = smem_base + stage * Int32(self.stage_bytes)
@@ -535,6 +556,9 @@ class W4A8MaterializedPhase1Kernel:
                     intermediate_tiles,
                     total_k32,
                     tid,
+                    gate_bounds,
+                    csf_value_offset,
+                    gate_base_word,
                 )
                 self._stage_n64_sfb(
                     w13_sfb_rp,
@@ -546,6 +570,9 @@ class W4A8MaterializedPhase1Kernel:
                     intermediate_tiles,
                     total_k32,
                     tid,
+                    up_bounds,
+                    csf_value_offset,
+                    up_base_word,
                 )
         else:
             self._stage_b_half_k64(
@@ -645,6 +672,32 @@ class W4A8MaterializedPhase1Kernel:
             if cutlass.const_expr(self.trellis_direct_lut):
                 trellis_lut_addr = trellis_lut.iterator.toint()
 
+        gate_bounds, up_bounds = None, None
+        gate_base_word, up_base_word = None, None
+        csf_value_offset = None
+        if cutlass.const_expr(self.csf_inline):
+            # A task holds its expert and output row group across the K sweep.
+            # Fetch each column group's dependent global bounds once, then
+            # select fixed register fields through producer-warp shuffles.
+            section_expert = expert_idx * Int32(self.csf_reader.plane.sections)
+            # The exception value plane is shared by every expert and K tile.
+            csf_value_offset = self.csf_reader.plane.group_value_offset(
+                w13_sfb_rp.iterator
+            )
+            gate_bounds = self.csf_reader.prefetch_column_bounds(
+                w13_sfb_rp.iterator, section_expert + Int32(1), output_tile
+            )
+            up_bounds = self.csf_reader.prefetch_column_bounds(
+                w13_sfb_rp.iterator, section_expert, output_tile
+            )
+            # Row bases are invariant across the column groups staged by a task.
+            gate_base_word = self.csf_reader.prefetch_row_bases(
+                w13_sfb_rp.iterator, section_expert + Int32(1), output_tile, tid
+            )
+            up_base_word = self.csf_reader.prefetch_row_bases(
+                w13_sfb_rp.iterator, section_expert, output_tile, tid
+            )
+
         input_k64_tiles = input_k128_tiles * Int32(2)
         for preload_slice in cutlass.range_constexpr(self.stages - 1):
             k64_slice = Int32(preload_slice)
@@ -666,6 +719,11 @@ class W4A8MaterializedPhase1Kernel:
                     input_k128_tiles,
                     intermediate_tiles,
                     packed_w13_tiles,
+                    gate_bounds,
+                    up_bounds,
+                    csf_value_offset,
+                    gate_base_word,
+                    up_base_word,
                 )
             cute.arch.cp_async_commit_group()
 
@@ -727,6 +785,11 @@ class W4A8MaterializedPhase1Kernel:
                     input_k128_tiles,
                     intermediate_tiles,
                     packed_w13_tiles,
+                    gate_bounds,
+                    up_bounds,
+                    csf_value_offset,
+                    gate_base_word,
+                    up_base_word,
                 )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(self.stages - 1)

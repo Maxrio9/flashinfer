@@ -1,0 +1,1291 @@
+diff --git a/flashinfer/experimental/b12x/_lib/quant/csf_inline.py b/flashinfer/experimental/b12x/_lib/quant/csf_inline.py
+--- a/flashinfer/experimental/b12x/_lib/quant/csf_inline.py
++++ b/flashinfer/experimental/b12x/_lib/quant/csf_inline.py
+@@ -10,0 +11 @@
++    st_shared_u8,
+@@ -11,0 +13 @@
++    ld_global_nc_u32,
+@@ -65 +67,110 @@
+-    def stage_compressed(self, storage, expert, group, target, lane, bounds=None):
++    def prefetch_column_bounds(self, storage, expert, row_group):
++        """Keep one row group's exception bounds in warp-distributed registers."""
++        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
++        groups = self.plane.storage.column_groups
++        bounds = cute.make_rmem_tensor(
++            cute.make_layout(((groups + 31) // 32, 2)), Uint32
++        )
++        bounds.fill(Uint32(0))
++        lane = Int32(cute.arch.lane_idx())
++        for chunk in cutlass.range_constexpr((groups + 31) // 32):
++            column = lane + Int32(chunk * 32)
++            if column < Int32(groups):
++                group = row_group * Int32(groups) + column
++                first, end = self.plane.group_record_bounds(storage, expert, group)
++                bounds[chunk, 0] = first
++                bounds[chunk, 1] = end
++        return bounds
++
++    @cute.jit
++    def prefetch_row_bases(self, storage, expert, row_group, lane):
++        """Keep four adjacent row bases per producer lane across a K sweep."""
++        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
++        row = row_group * Int32(128) + lane * Int32(4)
++        word = Uint32(0)
++        if lane < Int32(32) and row < Int32(self.plane.storage.rows):
++            offset = Int64(self.plane.storage.bases) + (
++                expert * Int32(self.plane.storage.rows) + row
++            ).to(Int64)
++            word = ld_global_nc_u32((storage + offset).toint())
++        return word
++
++    @cute.jit
++    def expand_warp_rows(self, storage, slot, rows, warp, lane):
++        """Rebuild one warp's 32 rows of a staged row-major slot into ``rows``.
++
++        Each lane reconstructs one row's scale word from the staged codes and bases;
++        the warp then applies the slot's exception records that fall in its rows. Only
++        the reconstructing warp reads its rows, so a warp barrier publishes them and the
++        staged slot is left unchanged.
++        """
++        assert self.plane.destination == 3 and self.plane.storage.bits == 1
++        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
++        group = ld_shared_u32(slot + Int32(500)).to(Int32)
++        source_group = group % Int32(self.plane.storage.groups)
++        nr = cutlass.min(
++            Int32(128),
++            Int32(self.plane.storage.rows)
++            - source_group // Int32(self.plane.storage.column_groups) * Int32(128),
++        )
++        nc = cutlass.min(
++            Int32(4),
++            Int32(self.plane.columns)
++            - source_group % Int32(self.plane.storage.column_groups) * Int32(4),
++        )
++        row = warp * Int32(32) + lane
++        word = Uint32(0)
++        if row < nr:
++            field = row * nc
++            shift = field % Int32(32)
++            codes = ld_shared_u32(slot + field // Int32(32) * Int32(4)) >> shift.to(Uint32)
++            if shift + nc > Int32(32):
++                codes |= ld_shared_u32(
++                    slot + field // Int32(32) * Int32(4) + Int32(4)
++                ) << (Int32(32) - shift).to(Uint32)
++            codes &= (Uint32(1) << nc.to(Uint32)) - Uint32(1)
++            codes = (codes | (codes << Uint32(14))) & Uint32(0x00030003)
++            codes = (codes | (codes << Uint32(7))) & Uint32(0x01010101)
++            base = (
++                ld_shared_u32(slot + Int32(256) + row // Int32(4) * Int32(4))
++                >> ((row % Int32(4)) * Int32(8)).to(Uint32)
++            ) & Uint32(255)
++            word = base * (
++                Uint32(0x01010101) >> ((Int32(4) - nc) * Int32(8)).to(Uint32)
++            ) + codes
++        st_shared_u32(rows + row * Int32(4), word)
++        cute.arch.sync_warp()
++        first = ld_shared_u32(slot + Int32(384))
++        end = ld_shared_u32(slot + Int32(388))
++        if first + lane.to(Uint32) < end:
++            p = (first & Uint32(1)).to(Int32) + lane
++            position = (
++                (
++                    ld_shared_u32(slot + Int32(392) + p // Int32(2) * Int32(4))
++                    >> ((p % Int32(2)) * Int32(16)).to(Uint32)
++                )
++                & Uint32(65535)
++            ).to(Int32)
++            v = ld_shared_u32(slot + Int32(496)).to(Int32) + lane
++            value = (
++                ld_shared_u32(slot + Int32(460) + v // Int32(4) * Int32(4))
++                >> ((v % Int32(4)) * Int32(8)).to(Uint32)
++            ) & Uint32(255)
++            if position // nc // Int32(32) == warp:
++                st_shared_u8(
++                    rows + position // nc * Int32(4) + position % nc,
++                    value.to(cutlass.Uint8),
++                )
++        value_offset = self.plane.group_value_offset(storage)
++        entry = first + Uint32(32) + lane.to(Uint32)
++        while entry < end:
++            position, value = self.plane.load_group_record(storage, entry, value_offset)
++            if position // nc // Int32(32) == warp:
++                st_shared_u8(rows + position // nc * Int32(4) + position % nc, value)
++            entry += Uint32(32)
++        cute.arch.sync_warp()
++
++    @cute.jit
++    def stage_compressed(
++        self, storage, expert, group, target, lane, bounds=None, value_offset=None, base_word=None
++    ):
+@@ -92 +203,3 @@
+-        value_start = self.plane.group_value_offset(storage) + first.to(Int64)
++        if cutlass.const_expr(value_offset is None):
++            value_offset = self.plane.group_value_offset(storage)
++        value_start = value_offset + first.to(Int64)
+@@ -124,14 +237,21 @@
+-        if lane < Int32(8):
+-            if valid and lane * Int32(16) < nr:
+-                cp_async4_shared_global(
+-                    address + Int32(256) + lane * Int32(16),
+-                    (storage + bases + lane.to(Int64) * Int64(16)).toint(),
+-                )
+-            else:
+-                st_shared_v4_u32(
+-                    address + Int32(256) + lane * Int32(16),
+-                    Uint32(0),
+-                    Uint32(0),
+-                    Uint32(0),
+-                    Uint32(0),
+-                )
++        if cutlass.const_expr(base_word is not None):
++            if lane < Int32(32):
++                word = Uint32(0)
++                if valid:
++                    word = base_word
++                st_shared_u32(address + Int32(256) + lane * Int32(4), word)
++        else:
++            if lane < Int32(8):
++                if valid and lane * Int32(16) < nr:
++                    cp_async4_shared_global(
++                        address + Int32(256) + lane * Int32(16),
++                        (storage + bases + lane.to(Int64) * Int64(16)).toint(),
++                    )
++                else:
++                    st_shared_v4_u32(
++                        address + Int32(256) + lane * Int32(16),
++                        Uint32(0),
++                        Uint32(0),
++                        Uint32(0),
++                        Uint32(0),
++                    )
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py b/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py
+--- a/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py
+@@ -1004,7 +1004,6 @@
+-        # Two ranks push each rank's segments into the peer's staging, where the
+-        # peer reads them from its own memory after the barrier: PCIe carries
+-        # posted writes instead of reads. Wider worlds stage locally and pull.
+-        if cutlass.const_expr(self._world_size == 2):
+-            local_stage = self._staging_words(staging[1 - self._rank])
+-        else:
+-            local_stage = self._staging_words(staging[self._rank])
++        # Every rank pushes its segments into each peer's staging and reads only
++        # its own memory after the barrier, so PCIe carries posted writes and no
++        # peer reads. Staging holds the peers' segments in rank order without the
++        # receiver's own.
++        own_stage = self._staging_words(staging[self._rank])
++        peers = Int64(self._world_size - 1)
+@@ -1023,4 +1022,10 @@
+-                _copy_16b(
+-                    local_input + source_pack * Int64(4),
+-                    local_stage + source_pack * Int64(4),
+-                )
++                for peer in cutlass.range_constexpr(self._world_size):
++                    if cutlass.const_expr(peer != self._rank):
++                        staged_pack = (
++                            Int64(batch_index) * peers
++                            + Int64(self._rank if self._rank < peer else self._rank - 1)
++                        ) * Int64(local_packs) + Int64(pack)
++                        _copy_16b(
++                            local_input + source_pack * Int64(4),
++                            self._staging_words(staging[peer]) + staged_pack * Int64(4),
++                        )
+@@ -1036,5 +1041,4 @@
+-        if cutlass.const_expr(self._world_size == 2):
+-            # Acquire the peer's pushed segments before reading them locally.
+-            if Int32(tidx) == Int32(0):
+-                _membar_sys()
+-            cute.arch.sync_threads()
++        # Acquire the peers' pushed segments before reading them locally.
++        if Int32(tidx) == Int32(0):
++            _membar_sys()
++        cute.arch.sync_threads()
+@@ -1057,9 +1061,8 @@
+-                        if cutlass.const_expr(source == self._rank):
+-                            source_words = local_input
+-                        elif cutlass.const_expr(self._world_size == 2):
+-                            source_words = self._staging_words(staging[self._rank])
+-                        else:
+-                            source_words = self._staging_words(staging[source])
+-                        source_address = Int64(
+-                            (source_words + source_pack * Int64(4)).toint()
+-                        )
++                        if cutlass.const_expr(source != self._rank):
++                            staged_pack = (
++                                Int64(batch_index) * peers
++                                + Int64(source if source < self._rank else source - 1)
++                            ) * Int64(local_packs) + Int64(pack)
++                            source_address = Int64(
++                                (own_stage + staged_pack * Int64(4)).toint()
++                            )
+@@ -1964 +1967 @@
+-            13,
++            14,
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase1.py
+@@ -324,0 +325,3 @@
++        bounds=None,
++        value_offset=None,
++        base_word=None,
+@@ -335,0 +339,13 @@
++                cached = None
++                if cutlass.const_expr(bounds is not None):
++                    first, end = Uint32(0), Uint32(0)
++                    for chunk in cutlass.range_constexpr(cute.size(bounds, mode=[0])):
++                        selected_first = cute.arch.shuffle_sync(
++                            bounds[chunk, 0], k128_slice % Int32(32)
++                        )
++                        selected_end = cute.arch.shuffle_sync(
++                            bounds[chunk, 1], k128_slice % Int32(32)
++                        )
++                        if k128_slice // Int32(32) == Int32(chunk):
++                            first, end = selected_first, selected_end
++                    cached = (first, end)
+@@ -337 +353 @@
+-                    scales.iterator, expert_idx, group, target, tid
++                    scales.iterator, expert_idx, group, target, tid, cached, value_offset, base_word
+@@ -395,0 +412,5 @@
++        gate_bounds=None,
++        up_bounds=None,
++        csf_value_offset=None,
++        gate_base_word=None,
++        up_base_word=None,
+@@ -537,0 +559,3 @@
++                    gate_bounds,
++                    csf_value_offset,
++                    gate_base_word,
+@@ -548,0 +573,3 @@
++                    up_bounds,
++                    csf_value_offset,
++                    up_base_word,
+@@ -647,0 +675,26 @@
++        gate_bounds, up_bounds = None, None
++        gate_base_word, up_base_word = None, None
++        csf_value_offset = None
++        if cutlass.const_expr(self.csf_inline):
++            # A task holds its expert and output row group across the K sweep.
++            # Fetch each column group's dependent global bounds once, then
++            # select fixed register fields through producer-warp shuffles.
++            section_expert = expert_idx * Int32(self.csf_reader.plane.sections)
++            # The exception value plane is shared by every expert and K tile.
++            csf_value_offset = self.csf_reader.plane.group_value_offset(
++                w13_sfb_rp.iterator
++            )
++            gate_bounds = self.csf_reader.prefetch_column_bounds(
++                w13_sfb_rp.iterator, section_expert + Int32(1), output_tile
++            )
++            up_bounds = self.csf_reader.prefetch_column_bounds(
++                w13_sfb_rp.iterator, section_expert, output_tile
++            )
++            # Row bases are invariant across the column groups staged by a task.
++            gate_base_word = self.csf_reader.prefetch_row_bases(
++                w13_sfb_rp.iterator, section_expert + Int32(1), output_tile, tid
++            )
++            up_base_word = self.csf_reader.prefetch_row_bases(
++                w13_sfb_rp.iterator, section_expert, output_tile, tid
++            )
++
+@@ -668,0 +722,5 @@
++                    gate_bounds,
++                    up_bounds,
++                    csf_value_offset,
++                    gate_base_word,
++                    up_base_word,
+@@ -729,0 +788,5 @@
++                    gate_bounds,
++                    up_bounds,
++                    csf_value_offset,
++                    gate_base_word,
++                    up_base_word,
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase2.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase2.py
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase2.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_phase2.py
+@@ -132,0 +133,5 @@
++    @property
++    def _region_words(self):
++        # Each warp reconstructs its scale rows outside the compressed pipeline slots.
++        return self.shared_words + (128 if self.csf_inline else 0)
++
+@@ -153,0 +159,2 @@
++        # Inline scale reconstruction assigns one expert task to the complete CTA.
++        assert not self.csf_inline or self.fused_topk == 0
+@@ -610,0 +618 @@
++            sfb_words = sfb_base
+@@ -612,8 +620,6 @@
+-                self.csf_reader.expand_slots(
+-                    down_sfb_rp.iterator,
+-                    sfb_base,
+-                    tid,
+-                    self.threads_per_cta,
+-                    self.tile_n // 128,
+-                )
+-                cute.arch.sync_threads()
++                # Each warp publishes only the 32 rows consumed by its N fragments.
++                assert self.tile_n == 128 and self.num_warps == 4
++                sfb_words = smem_base + Int32(self.shared_words * 4)
++                self.csf_reader.expand_warp_rows(
++                    down_sfb_rp.iterator, sfb_base, sfb_words, warp_idx, lane
++                )
+@@ -713 +719 @@
+-                                sfb_base + ((n8 * Int32(8) + q) << Int32(2))
++                                sfb_words + ((n8 * Int32(8) + q) << Int32(2))
+@@ -884 +890 @@
+-                    cutlass.Uint32, self.shared_words * self.fused_groups
++                    cutlass.Uint32, self._region_words * self.fused_groups
+@@ -951 +957 @@
+-                        smem_base + group * Int32(self.shared_words * 4),
++                        smem_base + group * Int32(self._region_words * 4),
+diff --git a/flashinfer/experimental/b12x/preparation/resume.py b/flashinfer/experimental/b12x/preparation/resume.py
+new file mode 100644
+--- /dev/null
++++ b/flashinfer/experimental/b12x/preparation/resume.py
+@@ -0,0 +1,70 @@
++"""Prepare additional programs while retaining explicitly drained sessions."""
++
++from contextlib import contextmanager
++from threading import Lock
++from weakref import WeakSet
++
++from b12x._lib.runtime_control import kernel_resolution_guard
++from .session import PreparationSession
++
++_ACTIVE = WeakSet()
++_LOCK = Lock()
++
++
++@contextmanager
++def additional_preparation(*sessions: PreparationSession):
++    """Temporarily release only the named sessions' kernel-resolution guards.
++
++    The caller must first stop native execution and confirm every participating
++    stream has drained. This function cannot establish external CUDA ownership.
++    Retained sessions must be frozen, idle and owned by the calling thread. Their
++    plans, program leases and frozen state remain unchanged; declare additional
++    work in a separate session. Do not close or retune retained sessions inside
++    this scope. Capture guards and guards from unnamed sessions remain active.
++
++    Every released guard is restored when the scope exits, including when
++    preparation raises. This is a preparation boundary, not a serving fallback.
++    """
++    if not sessions or len({id(session) for session in sessions}) != len(sessions):
++        raise ValueError("additional preparation requires distinct retained sessions")
++    with _LOCK:
++        for session in sessions:
++            if not isinstance(session, PreparationSession):
++                raise TypeError("retained owner must be a PreparationSession")
++            session._check_thread()
++            if session in _ACTIVE:
++                raise RuntimeError("retained session already has an active preparation scope")
++            if session.state != "FROZEN" or session._guard is None:
++                raise RuntimeError("additional preparation requires a frozen guarded session")
++            pending = session._pending_collective_barrier
++            if (session._job is not None or session._pool is not None
++                    or pending is not None and not pending.is_set()):
++                raise RuntimeError("additional preparation requires drained jobs and compiler pools")
++        _ACTIVE.update(sessions)
++    released = []
++    try:
++        for session in sessions:
++            guard = session._guard
++            guard.__exit__(None, None, None)
++            session._guard = None
++            released.append(session)
++        yield
++    finally:
++        try:
++            invalid = []
++            for session in reversed(released):
++                if session.state == "CLOSED":
++                    invalid.append("retained session was closed inside preparation scope")
++                    continue
++                if session.state != "FROZEN":
++                    invalid.append("retained session changed state inside preparation scope")
++                if session._guard is None:
++                    guard = kernel_resolution_guard("prepared serving session")
++                    guard.__enter__()
++                    session._guard = guard
++            if invalid:
++                raise RuntimeError("; ".join(invalid))
++        finally:
++            with _LOCK:
++                for session in sessions:
++                    _ACTIVE.discard(session)
+diff --git a/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py b/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py
+--- a/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py
++++ b/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py
+@@ -267 +267 @@
+-            13,
++            14,
+@@ -472,2 +472,2 @@
+-def test_all_gather_resolves_one_peer_address_before_each_copy() -> None:
+-    """The peer selector must not clone the memory transaction per rank."""
++def test_all_gather_pushes_segments_and_reads_only_local_memory() -> None:
++    """Ranks push segments into peers' staging; the read phase uses only local memory."""
+@@ -478 +478,4 @@
+-    read_phase = kernel_source.split("block_pair_barrier(", maxsplit=1)[1]
++    write_phase, read_phase = kernel_source.split("block_pair_barrier(", maxsplit=1)
++    assert "for peer in cutlass.range_constexpr(self._world_size):" in write_phase
++    assert "self._staging_words(staging[peer]) + staged_pack" in write_phase
++    assert "staging[" not in read_phase
+@@ -481,4 +484,2 @@
+-    assert "if cutlass.const_expr(source == self._rank):" in read_phase
+-    assert "source_words = local_input" in read_phase
+-    assert "source_words = self._staging_words(staging[source])" in read_phase
+-    assert "source_address = Int64(" in read_phase
++    assert "if cutlass.const_expr(source != self._rank):" in read_phase
++    assert "own_stage + staged_pack" in read_phase
+diff --git a/tests/experimental/b12x/comm/test_pcie_dcp_push_addresses.py b/tests/experimental/b12x/comm/test_pcie_dcp_push_addresses.py
+new file mode 100644
+--- /dev/null
++++ b/tests/experimental/b12x/comm/test_pcie_dcp_push_addresses.py
+@@ -0,0 +1,96 @@
++"""Check peer staging arithmetic without importing CUDA or compiling kernels.
++
++The arithmetic coverage includes wider rank counts; GPU synchronization and
++native replay require separate multi-GPU tests.
++"""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++
++_KERNEL = (
++    Path(__file__).resolve().parents[4]
++    / "flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py"
++)
++
++
++def _staging_expressions():
++    tree = ast.parse(_KERNEL.read_text())
++    launch = next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "_AllGatherHeadsLaunch"
++    )
++    kernel = next(
++        node
++        for node in launch.body
++        if isinstance(node, ast.FunctionDef) and node.name == "kernel"
++    )
++    expressions = [
++        node.value
++        for node in ast.walk(kernel)
++        if isinstance(node, ast.Assign)
++        and any(
++            isinstance(target, ast.Name) and target.id == "staged_pack"
++            for target in node.targets
++        )
++    ]
++    assert len(expressions) == 2
++    return [compile(ast.Expression(node), str(_KERNEL), "eval") for node in expressions]
++
++
++@pytest.mark.parametrize("world", (2, 4, 8, 9, 10, 12, 16))
++def test_push_staging_addresses_match_rank_order_and_capacity(world):
++    write, read = _staging_expressions()
++    for batches in (1, 2, 13, 24, 32, 40, 49, 64, 192):
++        for local_packs in (4, 8, 24, 32, 33, 72, 1560, 4040):
++            for receiver in range(world):
++                sources = [rank for rank in range(world) if rank != receiver]
++                for slot, source in enumerate(sources):
++                    for batch in sorted({0, batches - 1}):
++                        for pack in sorted(
++                            {
++                                0,
++                                local_packs - 1,
++                                min(31, local_packs - 1),
++                                min(32, local_packs - 1),
++                            }
++                        ):
++                            common = dict(
++                                Int64=int,
++                                batch_index=batch,
++                                peers=world - 1,
++                                local_packs=local_packs,
++                                pack=pack,
++                            )
++                            written = eval(
++                                write,
++                                {},
++                                dict(
++                                    common,
++                                    self=SimpleNamespace(_rank=source),
++                                    peer=receiver,
++                                ),
++                            )
++                            consumed = eval(
++                                read,
++                                {},
++                                dict(
++                                    common,
++                                    self=SimpleNamespace(_rank=receiver),
++                                    source=source,
++                                ),
++                            )
++                            expected = (batch * (world - 1) + slot) * local_packs + pack
++                            assert written == consumed == expected
++                            assert 0 <= written < batches * (world - 1) * local_packs
++                            # The caller's allocation covers every rank, including self.
++                            assert (
++                                batches * (world - 1) * local_packs
++                                < batches * world * local_packs
++                            )
++                            if world == 2:
++                                assert written == batch * local_packs + pack
+diff --git a/tests/experimental/b12x/moe/test_mxfp4_csf_dense_tail.py b/tests/experimental/b12x/moe/test_mxfp4_csf_dense_tail.py
+new file mode 100644
+--- /dev/null
++++ b/tests/experimental/b12x/moe/test_mxfp4_csf_dense_tail.py
+@@ -0,0 +1,67 @@
++"""Inline-CSF W4A8 dynamic MoE with exception tails: groups carry more than 32 exception records.
++
++Reuses test_mxfp4_csf.py's comparison of inline scales against natively expanded scales under
++poisoned graph replay, with 16-row dense overrides so the staged exception list overflows into the
++resident record tail.
++"""
++
++import numpy as np
++import pytest
++import torch
++
++from . import test_mxfp4_csf as base
++
++
++def _dense_planes(rows, columns, *, experts, seed):
++    from b12x.loader._csf_blocks import export_csf_blocks
++    from b12x.moe import fused_moe as moe
++
++    device = base.require_b12x()
++    rng = np.random.default_rng(seed + rows + columns)
++    fixed, exceptions, grids = [], [], []
++    for _ in range(experts):
++        bases = rng.integers(120, 126, rows).astype(np.uint8)
++        grid = bases[:, None] + rng.integers(0, 2, (rows, columns)).astype(np.uint8)
++        grid.reshape(-1)[::97] = rng.integers(116, 130, grid.reshape(-1)[::97].shape)
++        for row in rng.choice(rows - 16, 3, replace=False):
++            grid[row : row + 16] = rng.integers(114, 132, (16, columns))
++        selected = grid == bases[:, None] + 1
++        outside = (grid != bases[:, None]) & ~selected
++        selectors = np.packbits(selected, axis=1, bitorder="little")
++        fixed.append(
++            torch.from_numpy(
++                np.concatenate(
++                    (bases.reshape(-1, 16), selectors.reshape(rows // 16, -1)), 1
++                )
++            )
++        )
++        position = np.flatnonzero(outside).astype(np.uint32)
++        column_groups = (columns + 3) // 4
++        group = position // columns // 128 * column_groups + position % columns // 4
++        assert np.bincount(group).max() > 32
++        exceptions.append(
++            torch.from_numpy(
++                position | (grid.reshape(-1)[position].astype(np.uint32) << 24)
++            )
++        )
++        grids.append(grid)
++    batch = moe.CsfBlockPlanes(
++        tuple(
++            export_csf_blocks(f, x, rows=rows, columns=columns, quantization="mxfp4")
++            for f, x in zip(fixed, exceptions, strict=True)
++        )
++    )
++    return batch, torch.from_numpy(np.stack(grids)).to(device)
++
++
++@pytest.mark.parametrize(
++    "h,n,tokens,tile_m", [(5120, 576, 128, 16), (512, 256, 32, 32)]
++)
++@pytest.mark.parametrize("layout", ["w13", "w31"])
++def test_dense_exception_tail_inline_poisoned_graph(
++    h, n, tokens, tile_m, layout, monkeypatch
++):
++    monkeypatch.setattr(base, "_csf_planes", _dense_planes)
++    base.test_inline_poisoned_graph(
++        h, n, tokens, "dynamic", tile_m, layout, monkeypatch
++    )
+diff --git a/tests/experimental/b12x/preparation/test_resume.py b/tests/experimental/b12x/preparation/test_resume.py
+new file mode 100644
+--- /dev/null
++++ b/tests/experimental/b12x/preparation/test_resume.py
+@@ -0,0 +1,125 @@
++"""Host-only boundaries for preparation that retains frozen program owners."""
++import threading
++
++import pytest
++
++from b12x.preparation import DetectedDevice, PreparationSession
++from b12x.preparation.resume import additional_preparation
++from b12x._lib.runtime_control import kernel_resolution_guard, kernel_resolution_frozen
++
++
++@pytest.fixture
++def session():
++    retained = PreparationSession(device=DetectedDevice(None, None), compile_workers=0)
++    retained.freeze()
++    yield retained
++    retained.close()
++
++
++def test_scope_retains_frozen_state_and_payload_collections(session):
++    plans, shared = session._plans, session._shared
++    payload = object()
++    shared['fixture'] = payload
++    assert kernel_resolution_frozen()
++    with additional_preparation(session):
++        assert not kernel_resolution_frozen()
++        assert session.state == 'FROZEN'
++        assert session._plans is plans and session._shared is shared
++        assert shared['fixture'] is payload
++    assert kernel_resolution_frozen()
++    assert session._plans is plans and shared['fixture'] is payload
++
++
++def test_exception_restores_guard(session):
++    with pytest.raises(ValueError, match='fixture error'):
++        with additional_preparation(session):
++            raise ValueError('fixture error')
++    assert kernel_resolution_frozen() and session.state == 'FROZEN'
++
++
++def test_other_session_and_capture_guards_remain_active(session):
++    other = PreparationSession(device=DetectedDevice(None, None), compile_workers=0)
++    other.freeze()
++    try:
++        with additional_preparation(session):
++            assert kernel_resolution_frozen()
++        with additional_preparation(session, other):
++            assert not kernel_resolution_frozen()
++            with kernel_resolution_guard('fixture capture'):
++                assert kernel_resolution_frozen()
++        assert kernel_resolution_frozen()
++    finally:
++        other.close()
++
++
++def test_all_owners_validated_before_any_guard_is_removed(session):
++    with pytest.raises(TypeError):
++        with additional_preparation(session, object()):
++            pytest.fail('invalid owner entered scope')
++    assert kernel_resolution_frozen() and session._guard is not None
++
++
++def test_reentry_and_duplicate_sessions_are_rejected(session):
++    with pytest.raises(ValueError):
++        with additional_preparation(session, session):
++            pass
++    with additional_preparation(session):
++        with pytest.raises(RuntimeError, match='active preparation scope'):
++            with additional_preparation(session):
++                pass
++    assert kernel_resolution_frozen()
++
++
++@pytest.mark.parametrize('field', ['_job', '_pool', '_pending_collective_barrier'])
++def test_pending_preparation_rejected_without_changing_guard(session, field):
++    setattr(session, field, threading.Event() if field == '_pending_collective_barrier' else object())
++    try:
++        with pytest.raises(RuntimeError, match='drained'):
++            with additional_preparation(session):
++                pass
++        assert kernel_resolution_frozen()
++    finally:
++        setattr(session, field, None)
++
++
++def test_owning_thread_required(session):
++    errors = []
++    def enter():
++        try:
++            with additional_preparation(session):
++                pass
++        except RuntimeError as error:
++            errors.append(str(error))
++    thread = threading.Thread(target=enter)
++    thread.start(); thread.join()
++    assert len(errors) == 1 and 'another thread' in errors[0]
++    assert kernel_resolution_frozen()
++
++
++def test_open_and_closed_sessions_rejected():
++    retained = PreparationSession(device=DetectedDevice(None, None), compile_workers=0)
++    with pytest.raises(RuntimeError, match='frozen'):
++        with additional_preparation(retained):
++            pass
++    retained.close()
++    with pytest.raises(RuntimeError, match='closed'):
++        with additional_preparation(retained):
++            pass
++
++
++def test_closed_session_does_not_receive_a_replacement_guard(session):
++    with pytest.raises(RuntimeError, match='closed inside'):
++        with additional_preparation(session):
++            session.close()
++    assert session.state == 'CLOSED' and session._guard is None
++    assert not kernel_resolution_frozen()
++
++
++def test_completed_collective_barrier_is_drained(session):
++    completed = threading.Event()
++    completed.set()
++    session._pending_collective_barrier = completed
++    with additional_preparation(session):
++        assert not kernel_resolution_frozen()
++        assert session._pending_collective_barrier is completed
++    assert kernel_resolution_frozen()
+diff --git a/tests/experimental/b12x/quantization/test_csf_column_bounds.py b/tests/experimental/b12x/quantization/test_csf_column_bounds.py
+new file mode 100644
+--- /dev/null
++++ b/tests/experimental/b12x/quantization/test_csf_column_bounds.py
+@@ -0,0 +1,328 @@
++"""Prefetched bounds and row bases preserve CPU offsets and decoded scale bytes."""
++
++import cutlass
++import cutlass.cute as cute
++import cutlass.utils
++import pytest
++import numpy as np
++import torch
++from cutlass.cutlass_dsl import Int32, Uint32
++
++from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
++from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane, upload_csf_block_payload
++from b12x._lib.quant.csf_inline import CsfInlineReader
++from b12x._lib.utils.device import current_cuda_stream
++from b12x._lib.utils.pointers import make_ptr
++from .test_csf_blocks import planes_and_native
++from .test_csf_native_preparation import logical_grid
++from ..conftest import require_b12x
++
++
++class ReadColumnBounds:
++    def __init__(self, geometry, prefetched, decode):
++        self.reader = CsfInlineReader(geometry)
++        self.prefetched = prefetched
++        self.decode = decode
++        self.row_groups = (self.reader.plane.storage.rows + 127) // 128
++        self.blocks = self.reader.plane.storage.experts * self.row_groups
++
++    @cute.jit
++    def __call__(
++        self,
++        source: cute.Pointer,
++        output: cute.Pointer,
++        observed: cute.Pointer,
++        poison: cute.Pointer,
++        stream,
++    ):
++        self.kernel(source, output, observed, poison).launch(
++            grid=(self.blocks, 1, 1), block=(32, 1, 1), stream=stream
++        )
++
++    @cute.kernel
++    def kernel(self, source, output, observed, poison):
++        lane, _, _ = cute.arch.thread_idx()
++        block, _, _ = cute.arch.block_idx()
++        source_expert = Int32(block) // Int32(self.row_groups)
++        row_group = Int32(block) % Int32(self.row_groups)
++        columns = self.reader.plane.storage.column_groups
++        groups = self.reader.plane.storage.groups
++        sections = self.reader.plane.sections
++        expert = source_expert // Int32(sections)
++        section = source_expert % Int32(sections)
++        base_word = self.reader.prefetch_row_bases(
++            source, source_expert, row_group, Int32(lane)
++        )
++        bases_out = cute.make_tensor(
++            observed, cute.make_layout(self.blocks * columns * 4 + self.blocks * 32)
++        )
++        bases_out[self.blocks * columns * 4 + Int32(block) * 32 + Int32(lane)] = (
++            base_word.to(Int32)
++        )
++        cached_bounds = None
++        if cutlass.const_expr(self.prefetched):
++            cached_bounds = self.reader.prefetch_column_bounds(
++                source, source_expert, row_group
++            )
++        shared = cutlass.utils.SmemAllocator().allocate_tensor(
++            Uint32, cute.make_layout(128), byte_alignment=16
++        )
++        target = cute.recast_ptr(shared.iterator, dtype=cutlass.Uint8)
++        poison_value = cute.make_tensor(poison, cute.make_layout(1))[0]
++        for column in range(columns):
++            # Reuse one staging slot across column groups and graph replays.
++            for i in cutlass.range_constexpr(4):
++                shared[Int32(lane) + Int32(i * 32)] = poison_value
++            cute.arch.sync_warp()
++            local_group = row_group * Int32(columns) + Int32(column)
++            group = section * Int32(groups) + local_group
++            direct_first, direct_end = self.reader.plane.group_record_bounds(
++                source, source_expert, local_group
++            )
++            first, end = direct_first, direct_end
++            if cutlass.const_expr(self.prefetched):
++                first, end = Uint32(0), Uint32(0)
++                for chunk in cutlass.range_constexpr(
++                    cute.size(cached_bounds, mode=[0])
++                ):
++                    selected_first = cute.arch.shuffle_sync(
++                        cached_bounds[chunk, 0], Int32(column) % Int32(32)
++                    )
++                    selected_end = cute.arch.shuffle_sync(
++                        cached_bounds[chunk, 1], Int32(column) % Int32(32)
++                    )
++                    if Int32(column) // Int32(32) == Int32(chunk):
++                        first, end = selected_first, selected_end
++            index = Int32(block) * Int32(columns) + Int32(column)
++            if lane == 0:
++                bounds_out = cute.make_tensor(
++                    observed, cute.make_layout(self.blocks * columns * 4)
++                )
++                bounds_out[index * 4] = direct_first
++                bounds_out[index * 4 + 1] = direct_end
++                bounds_out[index * 4 + 2] = first
++                bounds_out[index * 4 + 3] = end
++            if cutlass.const_expr(self.decode):
++                if cutlass.const_expr(self.prefetched):
++                    self.reader.stage_compressed(
++                        source,
++                        expert,
++                        group,
++                        target,
++                        Int32(lane),
++                        (first, end),
++                        None,
++                        base_word,
++                    )
++                else:
++                    self.reader.stage_compressed(
++                        source, expert, group, target, Int32(lane)
++                    )
++                cute.arch.cp_async_commit_group()
++                cute.arch.cp_async_wait_group(0)
++                cute.arch.sync_warp()
++                self.reader.expand_compressed(source, group, target, Int32(lane))
++                nr = cutlass.min(
++                    Int32(128), Int32(self.reader.plane.storage.rows) - row_group * 128
++                )
++                nc = cutlass.min(
++                    Int32(4), Int32(self.reader.plane.columns) - Int32(column) * 4
++                )
++                out = cute.make_tensor(
++                    cute.recast_ptr(output, dtype=Uint32),
++                    cute.make_layout(self.blocks * columns * 128),
++                )
++                for quarter in cutlass.range_constexpr(4):
++                    position = Int32(lane) * 16 + Int32(quarter * 4)
++                    if position < nr * nc:
++                        out[index * 128 + position // 4] = shared[position // 4]
++                cute.arch.sync_warp()
++
++
++def _exercise(quantization, rows, columns, sections, exceptions, decode):
++    device = require_b12x()
++    planes, native = planes_and_native(
++        rows,
++        columns,
++        2,
++        quantization=quantization,
++        dense=exceptions == "dense",
++        empty=exceptions == "empty",
++    )
++    logical = logical_grid(native, rows, columns)
++    payload = upload_csf_block_payload(
++        planes,
++        device,
++        native_codes=True,
++        group_record_bytes=3,
++        destination=3,
++        group_rows=rows // sections,
++    )
++    plane = Nvfp4CompactBlockPlane(payload)
++    # The asynchronous slot decoder requires aligned expert code planes.
++    assert plane.scales.geometry.code_bytes % 16 == 0
++    row_groups = (rows // sections + 127) // 128
++    column_groups = (columns + 3) // 4
++    count = 2 * sections * row_groups * column_groups
++    expected = torch.full((count, 512), 0xD3, dtype=torch.uint8)
++    index = 0
++    for expert in range(2):
++        for section in range(sections):
++            for r in range(row_groups):
++                nr = min(128, rows // sections - r * 128)
++                for c in range(column_groups):
++                    nc = min(4, columns - c * 4)
++                    values = logical[
++                        expert,
++                        section * (rows // sections) + r * 128 : section
++                        * (rows // sections)
++                        + r * 128
++                        + nr,
++                        c * 4 : c * 4 + nc,
++                    ]
++                    expected[index, : nr * nc] = values.reshape(-1)
++                    index += 1
++    outputs = [torch.empty_like(expected, device=device) for _ in range(2)]
++    observed = [
++        torch.empty(
++            count * 4 + 2 * sections * row_groups * 32, dtype=torch.int32, device=device
++        )
++        for _ in range(2)
++    ]
++    poison = torch.zeros(1, dtype=torch.int32, device=device)
++    source_before = payload.storage.clone()
++    # Independently read the serialized CPU page-base/prefix tables. Their
++    # terminal prefix per 32-group page is part of the storage contract.
++    layout = plane.scales.geometry
++    raw = source_before.cpu().numpy()
++    pages = np.frombuffer(
++        raw, dtype="<u4", count=layout.experts * layout.pages, offset=layout.page_bases
++    ).reshape(layout.experts, layout.pages)
++    prefixes = np.frombuffer(
++        raw, dtype="<u2", count=layout.experts * layout.prefixes, offset=layout.offsets
++    ).reshape(layout.experts, layout.prefixes)
++    cpu_bounds = []
++    for expert in range(layout.experts):
++        for group in range(layout.groups):
++            page = group // 32
++            prefix = group + page
++            first = int(pages[expert, page]) + int(prefixes[expert, prefix])
++            end = int(pages[expert, page]) + int(prefixes[expert, prefix + 1])
++            cpu_bounds.append((first, end, first, end))
++    cpu_bounds = torch.tensor(cpu_bounds, dtype=torch.int32).reshape(-1)
++    base_bytes = raw[
++        layout.bases : layout.bases + layout.experts * layout.rows
++    ].reshape(layout.experts, layout.rows)
++    cpu_bases = np.zeros((layout.experts, row_groups, 128), dtype=np.uint8)
++    for expert in range(layout.experts):
++        for group in range(row_groups):
++            nr = min(128, layout.rows - group * 128)
++            cpu_bases[expert, group, :nr] = base_bytes[
++                expert, group * 128 : group * 128 + nr
++            ]
++    cpu_observed = torch.cat(
++        (cpu_bounds, torch.from_numpy(cpu_bases.reshape(-1).view(np.int32)).clone())
++    )
++    ptr = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
++    i32ptr = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
++    programs = [
++        b12x_compile(
++            ReadColumnBounds(plane.geometry, cached, decode),
++            ptr,
++            ptr,
++            i32ptr,
++            i32ptr,
++            current_cuda_stream(),
++            compile_spec=KernelCompileSpec.from_key(
++                "test.csf_column_bounds_and_row_bases",
++                1,
++                (plane.geometry, cached, decode),
++            ),
++        )
++        for cached in (False, True)
++    ]
++    source = make_ptr(
++        cutlass.Uint8,
++        payload.storage.data_ptr(),
++        cute.AddressSpace.gmem,
++        assumed_align=16,
++    )
++    control = make_ptr(
++        cutlass.Int32, poison.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
++    )
++    graphs = []
++    try:
++        for program, out, bounds in zip(programs, outputs, observed, strict=True):
++            args = (
++                source,
++                make_ptr(
++                    cutlass.Uint8,
++                    out.data_ptr(),
++                    cute.AddressSpace.gmem,
++                    assumed_align=16,
++                ),
++                make_ptr(
++                    cutlass.Int32,
++                    bounds.data_ptr(),
++                    cute.AddressSpace.gmem,
++                    assumed_align=16,
++                ),
++                control,
++            )
++            program(*args, current_cuda_stream())
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph):
++                program(*args, current_cuda_stream())
++            graphs.append(graph)
++        torch.cuda.synchronize()
++        allocated = torch.cuda.memory_allocated()
++        for value in (0x12345678, -1, 0):
++            poison.fill_(value)
++            for graph, out, bounds in zip(graphs, outputs, observed, strict=True):
++                out.fill_(0xD3)
++                bounds.fill_(-1)
++                graph.replay()
++            torch.cuda.synchronize()
++            assert torch.equal(outputs[0], outputs[1])
++            assert torch.equal(observed[0], observed[1])
++            for out, bounds in zip(outputs, observed, strict=True):
++                assert torch.equal(bounds.cpu(), cpu_observed)
++                if decode:
++                    assert torch.equal(out.cpu(), expected)
++                assert torch.equal(
++                    bounds[: count * 4].reshape(count, 4)[:, :2],
++                    bounds[: count * 4].reshape(count, 4)[:, 2:],
++                )
++            assert torch.equal(payload.storage, source_before)
++            assert torch.cuda.memory_allocated() == allocated
++    finally:
++        for graph in graphs:
++            graph.reset()
++
++
++@pytest.mark.parametrize("quantization", ["mxfp4", "nvfp4"])
++@pytest.mark.parametrize(
++    "rows,columns,sections",
++    [(128, 4, 1), (384, 130, 2), (512, 131, 2), (512, 161, 2), (1152, 160, 2)],
++)
++@pytest.mark.parametrize("exceptions", ["empty", "sparse", "dense"])
++def test_prefetched_column_bounds_and_cpu_bytes(
++    quantization, rows, columns, sections, exceptions
++):
++    # W4A8 K64-native operands have two/four scale columns per final group.
++    # Odd-column cases qualify the generic bounds helper independently of the
++    # shared decoder's two/four-column consumer restriction.
++    _exercise(quantization, rows, columns, sections, exceptions, columns % 2 == 0)
++
++
++@pytest.mark.parametrize("quantization", ["mxfp4", "nvfp4"])
++@pytest.mark.parametrize("columns", [131, 161])
++@pytest.mark.xfail(
++    strict=True,
++    raises=AssertionError,
++    reason="Shared destination3 decoder assumes two/four scale columns; qualify odd tails after its base-byte mapping is generalized",
++)
++def test_shared_decoder_odd_tail_cpu_bytes(quantization, columns):
++    # Keep the independent byte invariant visible; do not certify odd-tail
++    # decoding merely because prefetched and ordinary consumers agree.
++    _exercise(quantization, 512, columns, 2, "empty", True)
+diff --git a/tests/experimental/b12x/quantization/test_csf_warp_rows.py b/tests/experimental/b12x/quantization/test_csf_warp_rows.py
+new file mode 100644
+--- /dev/null
++++ b/tests/experimental/b12x/quantization/test_csf_warp_rows.py
+@@ -0,0 +1,213 @@
++"""Warp-local consumers reproduce padded scale words from canonical CSF slots."""
++
++import cutlass
++import cutlass.cute as cute
++import cutlass.utils
++import pytest
++import torch
++from cutlass.cutlass_dsl import Int32, Uint32
++
++from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
++from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane, upload_csf_block_payload
++from b12x._lib.quant.csf_inline import CsfInlineReader
++from b12x._lib.utils.device import current_cuda_stream
++from b12x._lib.utils.pointers import make_ptr
++from .test_csf_blocks import planes_and_native
++from .test_csf_native_preparation import logical_grid
++from ..conftest import require_b12x
++
++
++class ReadWords:
++    def __init__(self, geometry, warp_rows):
++        self.reader = CsfInlineReader(geometry)
++        self.warp_rows = warp_rows
++        self.threads = 128 if warp_rows else 32
++        self.init_rounds = 256 // self.threads
++        self.blocks = (
++            self.reader.plane.storage.experts * self.reader.plane.storage.groups
++        )
++
++    @cute.jit
++    def __call__(self, source: cute.Pointer, output: cute.Pointer, stream):
++        self.kernel(source, output).launch(
++            grid=(self.blocks, 1, 1), block=(self.threads, 1, 1), stream=stream
++        )
++
++    @cute.kernel
++    def kernel(self, source, output):
++        tid, _, _ = cute.arch.thread_idx()
++        lane, warp = Int32(tid) % Int32(32), Int32(tid) // Int32(32)
++        block, _, _ = cute.arch.block_idx()
++        groups = self.reader.plane.storage.groups * self.reader.plane.sections
++        expert, group = Int32(block) // Int32(groups), Int32(block) % Int32(groups)
++        shared = cutlass.utils.SmemAllocator().allocate_tensor(
++            cutlass.Uint32, cute.make_layout(256), byte_alignment=16
++        )
++        target = cute.recast_ptr(shared.iterator, dtype=cutlass.Uint8)
++        for i in cutlass.range_constexpr(self.init_rounds):
++            shared[Int32(tid) + Int32(i * self.threads)] = Uint32(0xA5A5A5A5)
++        cute.arch.sync_threads()
++        if warp == Int32(0):
++            self.reader.stage_compressed(source, expert, group, target, lane)
++        cute.arch.cp_async_commit_group()
++        cute.arch.cp_async_wait_group(0)
++        cute.arch.fence_proxy("async.shared", space="cta")
++        cute.arch.sync_threads()
++        if cutlass.const_expr(self.warp_rows):
++            self.reader.expand_warp_rows(
++                source,
++                target.toint().to(Int32),
++                target.toint().to(Int32) + Int32(512),
++                warp,
++                lane,
++            )
++        else:
++            self.reader.expand_compressed(source, group, target, lane)
++            self.reader.pad_rows(group, target, lane)
++        out = cute.make_tensor(
++            cute.recast_ptr(output, dtype=Uint32), cute.make_layout(self.blocks * 128)
++        )
++        for i in cutlass.range_constexpr(4):
++            row = lane + Int32(i * 32)
++            if cutlass.const_expr(self.warp_rows):
++                row = warp * Int32(32) + lane // Int32(4) + Int32(i * 8)
++                value = shared[Int32(128) + row]
++                if lane % Int32(4) == Int32(0):
++                    out[Int32(block) * Int32(128) + row] = value
++            else:
++                out[Int32(block) * Int32(128) + row] = shared[row]
++
++
++@pytest.mark.parametrize("pointer_dtype", [cutlass.Uint8, cutlass.Uint32])
++@pytest.mark.parametrize("quantization", ["mxfp4"])
++@pytest.mark.parametrize(
++    "rows,columns,sections", [(128, 4, 1), (1152, 160, 2), (5120, 18, 1), (192, 6, 1)]
++)
++@pytest.mark.parametrize("exceptions", ["empty", "sparse", "dense"])
++def test_warp_scale_words_exact(
++    pointer_dtype, quantization, rows, columns, sections, exceptions
++):
++    device = require_b12x()
++    planes, native = planes_and_native(
++        rows,
++        columns,
++        2,
++        quantization=quantization,
++        dense=exceptions == "dense",
++        empty=exceptions == "empty",
++    )
++    payload = upload_csf_block_payload(
++        planes,
++        device,
++        native_codes=True,
++        group_record_bytes=3,
++        destination=3,
++        group_rows=rows // sections,
++    )
++    plane = Nvfp4CompactBlockPlane(payload)
++    size = plane.scales.geometry.experts * plane.scales.geometry.groups * 128
++    # Independently assemble padded row words from the native CPU byte grid.
++    logical = logical_grid(native, rows, columns)
++    expected_bytes = torch.zeros((size // 128, 128, 4), dtype=torch.uint8)
++    block = 0
++    section_rows = rows // sections
++    for expert in range(2):
++        for section in range(sections):
++            for row_group in range((section_rows + 127) // 128):
++                nr = min(128, section_rows - row_group * 128)
++                start = section * section_rows + row_group * 128
++                for column in range((columns + 3) // 4):
++                    nc = min(4, columns - column * 4)
++                    expected_bytes[block, :nr, :nc] = logical[
++                        expert, start : start + nr, column * 4 : column * 4 + nc
++                    ]
++                    block += 1
++    expected = expected_bytes.reshape(-1).view(torch.int32)
++    outputs = [torch.empty(size, dtype=torch.int32, device=device) for _ in range(2)]
++    source_before = payload.storage.clone()
++    pointer = make_ptr(pointer_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
++    programs = [
++        b12x_compile(
++            ReadWords(plane.geometry, registers),
++            pointer,
++            make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
++            current_cuda_stream(),
++            compile_spec=KernelCompileSpec.from_key(
++                "test.csf_warp_rows", 1, (plane.geometry, registers, str(pointer_dtype))
++            ),
++        )
++        for registers in (False, True)
++    ]
++    source = make_ptr(
++        pointer_dtype,
++        payload.storage.data_ptr(),
++        cute.AddressSpace.gmem,
++        assumed_align=16,
++    )
++    pointers = [
++        make_ptr(cutlass.Uint8, o.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
++        for o in outputs
++    ]
++    graphs = []
++    for program, output in zip(programs, pointers, strict=True):
++        program(source, output, current_cuda_stream())
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            program(source, output, current_cuda_stream())
++        graphs.append(graph)
++    torch.cuda.synchronize()
++    allocated = torch.cuda.memory_allocated()
++    for poison in (0x12345678, -1, 0):
++        for graph, output in zip(graphs, outputs, strict=True):
++            output.fill_(poison)
++            graph.replay()
++        torch.cuda.synchronize()
++        assert all(torch.equal(outputs[0], output) for output in outputs[1:])
++        assert all(torch.equal(output.cpu(), expected) for output in outputs)
++        assert torch.equal(payload.storage, source_before)
++        assert torch.cuda.memory_allocated() == allocated
++
++
++@pytest.mark.parametrize("pointer_dtype", [cutlass.Uint8, cutlass.Uint32])
++@pytest.mark.parametrize("record_count", [6, 7, 8, 31, 32, 33, 212, 256])
++def test_global_record_tail_pointer_stride_boundary(
++    pointer_dtype, record_count, monkeypatch
++):
++    """The last replacement crosses staging capacity through either pointer view."""
++    import numpy as np
++    import sys
++    from b12x.loader._csf_blocks import export_csf_blocks
++
++    rows, columns = 128, 4
++    bases = np.full(rows, 120, dtype=np.uint8)
++    codes = np.zeros(rows * ((columns + 7) // 8), dtype=np.uint8)
++    fixed = np.concatenate(
++        (bases.reshape(-1, 16), codes.reshape(rows // 16, -1)), axis=1
++    )
++    tail_position = 104 * columns + 2
++    positions = [
++        position for position in range(rows * columns) if position != tail_position
++    ][: record_count - 1]
++    positions.append(tail_position)
++    assert len(positions) == len(set(positions)) == record_count
++    records = np.array(positions, dtype=np.uint32) | (np.uint32(128) << np.uint32(24))
++    plane = export_csf_blocks(
++        fixed, records, rows=rows, columns=columns, quantization="mxfp4"
++    )
++    assert plane.exceptions.size == record_count
++    logical = np.full((2, rows, columns), 120, dtype=np.uint8)
++    for position in positions:
++        logical[:, position // columns, position % columns] = 128
++    # logical_grid reverses the native [row_group,column_group,row32,row_block,col] packing.
++    native = torch.from_numpy(
++        logical.reshape(2, 1, 4, 32, 1, 4)
++        .transpose(0, 1, 4, 3, 2, 5)
++        .copy()
++        .reshape(2, rows, columns)
++    )
++    monkeypatch.setattr(
++        sys.modules[__name__],
++        "planes_and_native",
++        lambda *args, **kwargs: ((plane, plane), native),
++    )
++    test_warp_scale_words_exact(pointer_dtype, "mxfp4", rows, columns, 1, "sparse")

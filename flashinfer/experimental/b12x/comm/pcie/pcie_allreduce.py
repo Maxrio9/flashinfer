@@ -59,7 +59,7 @@ ISLAND_RS_MAX_BYTES = 160 * 1024
 PARTIAL_ISLAND_MAX_BYTES = 32 * 1024
 # Short messages retain the all-peer channel. Eligible larger BF16 payloads
 # use reduce-scatter followed by all-gather on a serialized TP4 channel.
-BF16_TWOSHOT_MIN_BYTES = 256 * 1024
+BF16_TWOSHOT_MIN_BYTES = 100 * 1024
 
 
 def _bf16_twoshot_supported(*, exchange_group, device, world_size) -> bool:

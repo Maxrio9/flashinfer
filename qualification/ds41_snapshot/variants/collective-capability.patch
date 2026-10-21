@@ -1,0 +1,205 @@
+diff --git a/flashinfer/experimental/b12x/preparation/resume.py b/flashinfer/experimental/b12x/preparation/resume.py
+new file mode 100644
+--- /dev/null
++++ b/flashinfer/experimental/b12x/preparation/resume.py
+@@ -0,0 +1,70 @@
++"""Prepare additional programs while retaining explicitly drained sessions."""
++
++from contextlib import contextmanager
++from threading import Lock
++from weakref import WeakSet
++
++from b12x._lib.runtime_control import kernel_resolution_guard
++from .session import PreparationSession
++
++_ACTIVE = WeakSet()
++_LOCK = Lock()
++
++
++@contextmanager
++def additional_preparation(*sessions: PreparationSession):
++    """Temporarily release only the named sessions' kernel-resolution guards.
++
++    The caller must first stop native execution and confirm every participating
++    stream has drained. This function cannot establish external CUDA ownership.
++    Retained sessions must be frozen, idle and owned by the calling thread. Their
++    plans, program leases and frozen state remain unchanged; declare additional
++    work in a separate session. Do not close or retune retained sessions inside
++    this scope. Capture guards and guards from unnamed sessions remain active.
++
++    Every released guard is restored when the scope exits, including when
++    preparation raises. This is a preparation boundary, not a serving fallback.
++    """
++    if not sessions or len({id(session) for session in sessions}) != len(sessions):
++        raise ValueError("additional preparation requires distinct retained sessions")
++    with _LOCK:
++        for session in sessions:
++            if not isinstance(session, PreparationSession):
++                raise TypeError("retained owner must be a PreparationSession")
++            session._check_thread()
++            if session in _ACTIVE:
++                raise RuntimeError("retained session already has an active preparation scope")
++            if session.state != "FROZEN" or session._guard is None:
++                raise RuntimeError("additional preparation requires a frozen guarded session")
++            pending = session._pending_collective_barrier
++            if (session._job is not None or session._pool is not None
++                    or pending is not None and not pending.is_set()):
++                raise RuntimeError("additional preparation requires drained jobs and compiler pools")
++        _ACTIVE.update(sessions)
++    released = []
++    try:
++        for session in sessions:
++            guard = session._guard
++            guard.__exit__(None, None, None)
++            session._guard = None
++            released.append(session)
++        yield
++    finally:
++        try:
++            invalid = []
++            for session in reversed(released):
++                if session.state == "CLOSED":
++                    invalid.append("retained session was closed inside preparation scope")
++                    continue
++                if session.state != "FROZEN":
++                    invalid.append("retained session changed state inside preparation scope")
++                if session._guard is None:
++                    guard = kernel_resolution_guard("prepared serving session")
++                    guard.__enter__()
++                    session._guard = guard
++            if invalid:
++                raise RuntimeError("; ".join(invalid))
++        finally:
++            with _LOCK:
++                for session in sessions:
++                    _ACTIVE.discard(session)
+diff --git a/tests/experimental/b12x/preparation/test_resume.py b/tests/experimental/b12x/preparation/test_resume.py
+new file mode 100644
+--- /dev/null
++++ b/tests/experimental/b12x/preparation/test_resume.py
+@@ -0,0 +1,125 @@
++"""Host-only boundaries for preparation that retains frozen program owners."""
++import threading
++
++import pytest
++
++from b12x.preparation import DetectedDevice, PreparationSession
++from b12x.preparation.resume import additional_preparation
++from b12x._lib.runtime_control import kernel_resolution_guard, kernel_resolution_frozen
++
++
++@pytest.fixture
++def session():
++    retained = PreparationSession(device=DetectedDevice(None, None), compile_workers=0)
++    retained.freeze()
++    yield retained
++    retained.close()
++
++
++def test_scope_retains_frozen_state_and_payload_collections(session):
++    plans, shared = session._plans, session._shared
++    payload = object()
++    shared['fixture'] = payload
++    assert kernel_resolution_frozen()
++    with additional_preparation(session):
++        assert not kernel_resolution_frozen()
++        assert session.state == 'FROZEN'
++        assert session._plans is plans and session._shared is shared
++        assert shared['fixture'] is payload
++    assert kernel_resolution_frozen()
++    assert session._plans is plans and shared['fixture'] is payload
++
++
++def test_exception_restores_guard(session):
++    with pytest.raises(ValueError, match='fixture error'):
++        with additional_preparation(session):
++            raise ValueError('fixture error')
++    assert kernel_resolution_frozen() and session.state == 'FROZEN'
++
++
++def test_other_session_and_capture_guards_remain_active(session):
++    other = PreparationSession(device=DetectedDevice(None, None), compile_workers=0)
++    other.freeze()
++    try:
++        with additional_preparation(session):
++            assert kernel_resolution_frozen()
++        with additional_preparation(session, other):
++            assert not kernel_resolution_frozen()
++            with kernel_resolution_guard('fixture capture'):
++                assert kernel_resolution_frozen()
++        assert kernel_resolution_frozen()
++    finally:
++        other.close()
++
++
++def test_all_owners_validated_before_any_guard_is_removed(session):
++    with pytest.raises(TypeError):
++        with additional_preparation(session, object()):
++            pytest.fail('invalid owner entered scope')
++    assert kernel_resolution_frozen() and session._guard is not None
++
++
++def test_reentry_and_duplicate_sessions_are_rejected(session):
++    with pytest.raises(ValueError):
++        with additional_preparation(session, session):
++            pass
++    with additional_preparation(session):
++        with pytest.raises(RuntimeError, match='active preparation scope'):
++            with additional_preparation(session):
++                pass
++    assert kernel_resolution_frozen()
++
++
++@pytest.mark.parametrize('field', ['_job', '_pool', '_pending_collective_barrier'])
++def test_pending_preparation_rejected_without_changing_guard(session, field):
++    setattr(session, field, threading.Event() if field == '_pending_collective_barrier' else object())
++    try:
++        with pytest.raises(RuntimeError, match='drained'):
++            with additional_preparation(session):
++                pass
++        assert kernel_resolution_frozen()
++    finally:
++        setattr(session, field, None)
++
++
++def test_owning_thread_required(session):
++    errors = []
++    def enter():
++        try:
++            with additional_preparation(session):
++                pass
++        except RuntimeError as error:
++            errors.append(str(error))
++    thread = threading.Thread(target=enter)
++    thread.start(); thread.join()
++    assert len(errors) == 1 and 'another thread' in errors[0]
++    assert kernel_resolution_frozen()
++
++
++def test_open_and_closed_sessions_rejected():
++    retained = PreparationSession(device=DetectedDevice(None, None), compile_workers=0)
++    with pytest.raises(RuntimeError, match='frozen'):
++        with additional_preparation(retained):
++            pass
++    retained.close()
++    with pytest.raises(RuntimeError, match='closed'):
++        with additional_preparation(retained):
++            pass
++
++
++def test_closed_session_does_not_receive_a_replacement_guard(session):
++    with pytest.raises(RuntimeError, match='closed inside'):
++        with additional_preparation(session):
++            session.close()
++    assert session.state == 'CLOSED' and session._guard is None
++    assert not kernel_resolution_frozen()
++
++
++def test_completed_collective_barrier_is_drained(session):
++    completed = threading.Event()
++    completed.set()
++    session._pending_collective_barrier = completed
++    with additional_preparation(session):
++        assert not kernel_resolution_frozen()
++        assert session._pending_collective_barrier is completed
++    assert kernel_resolution_frozen()

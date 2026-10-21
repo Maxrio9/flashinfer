@@ -8,7 +8,9 @@ from b12x._lib.intrinsics.packed import byte_perm
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
+    st_shared_u8,
     st_shared_v4_u32,
+    ld_global_nc_u32,
 )
 from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
 from b12x._lib.quant.csf_blocks import CompactBlockStoragePlane
@@ -62,7 +64,116 @@ class CsfInlineReader:
                 self.pad_rows(group, target, lane)
 
     @cute.jit
-    def stage_compressed(self, storage, expert, group, target, lane, bounds=None):
+    def prefetch_column_bounds(self, storage, expert, row_group):
+        """Keep one row group's exception bounds in warp-distributed registers."""
+        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
+        groups = self.plane.storage.column_groups
+        bounds = cute.make_rmem_tensor(
+            cute.make_layout(((groups + 31) // 32, 2)), Uint32
+        )
+        bounds.fill(Uint32(0))
+        lane = Int32(cute.arch.lane_idx())
+        for chunk in cutlass.range_constexpr((groups + 31) // 32):
+            column = lane + Int32(chunk * 32)
+            if column < Int32(groups):
+                group = row_group * Int32(groups) + column
+                first, end = self.plane.group_record_bounds(storage, expert, group)
+                bounds[chunk, 0] = first
+                bounds[chunk, 1] = end
+        return bounds
+
+    @cute.jit
+    def prefetch_row_bases(self, storage, expert, row_group, lane):
+        """Keep four adjacent row bases per producer lane across a K sweep."""
+        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
+        row = row_group * Int32(128) + lane * Int32(4)
+        word = Uint32(0)
+        if lane < Int32(32) and row < Int32(self.plane.storage.rows):
+            offset = Int64(self.plane.storage.bases) + (
+                expert * Int32(self.plane.storage.rows) + row
+            ).to(Int64)
+            word = ld_global_nc_u32((storage + offset).toint())
+        return word
+
+    @cute.jit
+    def expand_warp_rows(self, storage, slot, rows, warp, lane):
+        """Rebuild one warp's 32 rows of a staged row-major slot into ``rows``.
+
+        Each lane reconstructs one row's scale word from the staged codes and bases;
+        the warp then applies the slot's exception records that fall in its rows. Only
+        the reconstructing warp reads its rows, so a warp barrier publishes them and the
+        staged slot is left unchanged.
+        """
+        assert self.plane.destination == 3 and self.plane.storage.bits == 1
+        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
+        group = ld_shared_u32(slot + Int32(500)).to(Int32)
+        source_group = group % Int32(self.plane.storage.groups)
+        nr = cutlass.min(
+            Int32(128),
+            Int32(self.plane.storage.rows)
+            - source_group // Int32(self.plane.storage.column_groups) * Int32(128),
+        )
+        nc = cutlass.min(
+            Int32(4),
+            Int32(self.plane.columns)
+            - source_group % Int32(self.plane.storage.column_groups) * Int32(4),
+        )
+        row = warp * Int32(32) + lane
+        word = Uint32(0)
+        if row < nr:
+            field = row * nc
+            shift = field % Int32(32)
+            codes = ld_shared_u32(slot + field // Int32(32) * Int32(4)) >> shift.to(Uint32)
+            if shift + nc > Int32(32):
+                codes |= ld_shared_u32(
+                    slot + field // Int32(32) * Int32(4) + Int32(4)
+                ) << (Int32(32) - shift).to(Uint32)
+            codes &= (Uint32(1) << nc.to(Uint32)) - Uint32(1)
+            codes = (codes | (codes << Uint32(14))) & Uint32(0x00030003)
+            codes = (codes | (codes << Uint32(7))) & Uint32(0x01010101)
+            base = (
+                ld_shared_u32(slot + Int32(256) + row // Int32(4) * Int32(4))
+                >> ((row % Int32(4)) * Int32(8)).to(Uint32)
+            ) & Uint32(255)
+            word = base * (
+                Uint32(0x01010101) >> ((Int32(4) - nc) * Int32(8)).to(Uint32)
+            ) + codes
+        st_shared_u32(rows + row * Int32(4), word)
+        cute.arch.sync_warp()
+        first = ld_shared_u32(slot + Int32(384))
+        end = ld_shared_u32(slot + Int32(388))
+        if first + lane.to(Uint32) < end:
+            p = (first & Uint32(1)).to(Int32) + lane
+            position = (
+                (
+                    ld_shared_u32(slot + Int32(392) + p // Int32(2) * Int32(4))
+                    >> ((p % Int32(2)) * Int32(16)).to(Uint32)
+                )
+                & Uint32(65535)
+            ).to(Int32)
+            v = ld_shared_u32(slot + Int32(496)).to(Int32) + lane
+            value = (
+                ld_shared_u32(slot + Int32(460) + v // Int32(4) * Int32(4))
+                >> ((v % Int32(4)) * Int32(8)).to(Uint32)
+            ) & Uint32(255)
+            if position // nc // Int32(32) == warp:
+                st_shared_u8(
+                    rows + position // nc * Int32(4) + position % nc,
+                    value.to(cutlass.Uint8),
+                )
+        value_offset = self.plane.group_value_offset(storage)
+        entry = first + Uint32(32) + lane.to(Uint32)
+        while entry < end:
+            position, value = self.plane.load_group_record(storage, entry, value_offset)
+            if position // nc // Int32(32) == warp:
+                st_shared_u8(rows + position // nc * Int32(4) + position % nc, value)
+            entry += Uint32(32)
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def stage_compressed(
+        self, storage, expert, group, target, lane, bounds=None, value_offset=None, base_word=None
+    ):
         """Stage codes, bases and the first 32 exceptions in a 512-byte slot.
 
         Callers publish the asynchronous copies before reconstructing the slot.
@@ -89,7 +200,9 @@ class CsfInlineReader:
                     storage, source_expert, source_group
                 )
         address = target.toint().to(Int32)
-        value_start = self.plane.group_value_offset(storage) + first.to(Int64)
+        if cutlass.const_expr(value_offset is None):
+            value_offset = self.plane.group_value_offset(storage)
+        value_start = value_offset + first.to(Int64)
         if lane == Int32(0):
             st_shared_u32(address + Int32(384), first)
             st_shared_u32(address + Int32(388), end)
@@ -121,20 +234,27 @@ class CsfInlineReader:
                     Uint32(0),
                     Uint32(0),
                 )
-        if lane < Int32(8):
-            if valid and lane * Int32(16) < nr:
-                cp_async4_shared_global(
-                    address + Int32(256) + lane * Int32(16),
-                    (storage + bases + lane.to(Int64) * Int64(16)).toint(),
-                )
-            else:
-                st_shared_v4_u32(
-                    address + Int32(256) + lane * Int32(16),
-                    Uint32(0),
-                    Uint32(0),
-                    Uint32(0),
-                    Uint32(0),
-                )
+        if cutlass.const_expr(base_word is not None):
+            if lane < Int32(32):
+                word = Uint32(0)
+                if valid:
+                    word = base_word
+                st_shared_u32(address + Int32(256) + lane * Int32(4), word)
+        else:
+            if lane < Int32(8):
+                if valid and lane * Int32(16) < nr:
+                    cp_async4_shared_global(
+                        address + Int32(256) + lane * Int32(16),
+                        (storage + bases + lane.to(Int64) * Int64(16)).toint(),
+                    )
+                else:
+                    st_shared_v4_u32(
+                        address + Int32(256) + lane * Int32(16),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                    )
         count = cutlass.min(end - first, Uint32(32))
         if lane < Int32(17) and lane.to(Uint32) * Uint32(2) < count + (
             first & Uint32(1)
