@@ -2005,6 +2005,15 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
 
 
 @cute.jit
+def _mask_pv_bf16_pair(word, key, valid_rows):
+    # A zero softmax weight does not suppress NaNs in unused V rows.
+    # Mask B fragments by K coordinate while preserving every live value bit.
+    mask = cutlass.select_(key < valid_rows, Uint32(0xFFFF), Uint32(0))
+    mask |= cutlass.select_(key + Int32(1) < valid_rows, Uint32(0xFFFF0000), Uint32(0))
+    return word & mask
+
+
+@cute.jit
 def _literal_pv_mma_into_ofrag_plane_bf16_packed(
     o_frag: cute.Tensor,
     p_frag: cute.Tensor,
@@ -2021,6 +2030,7 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
     upcast_stride_plane,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    valid_rows=None,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -2064,6 +2074,12 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
             for mma_q in cutlass.range_constexpr(num_mma_q):
+                if const_expr(valid_rows is not None):
+                    key = row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+                    b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+                    b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+                    b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+                    b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
                     o_frag[mma_q, mma_d, 1],
@@ -2106,6 +2122,7 @@ def _literal_pv_mma_into_ofrag_plane_bf16_row0_1x1(
     num_mma_d_vo,
     upcast_stride_plane,
     v_scale,
+    valid_rows=None,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     v_row = row_base + warp_kv_idx * 16 + lane % 16
@@ -2149,6 +2166,16 @@ def _literal_pv_mma_into_ofrag_plane_bf16_row0_1x1(
             _smem_addr_from_b128_offset(v_plane_base_addr1, v_offset1)
         )
 
+        if const_expr(valid_rows is not None):
+            key = row_base + warp_kv_idx * 16 + (lane % 4) * 2
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
+            b4 = _mask_pv_bf16_pair(b4, key, valid_rows)
+            b5 = _mask_pv_bf16_pair(b5, key + Int32(8), valid_rows)
+            b6 = _mask_pv_bf16_pair(b6, key, valid_rows)
+            b7 = _mask_pv_bf16_pair(b7, key + Int32(8), valid_rows)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d0, 0],
             o_frag[0, mma_d0, 1],
@@ -2219,6 +2246,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
     upcast_stride_plane,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    valid_rows=None,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2274,6 +2302,12 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
                     v_offset_cur, mma_d // 2
                 )
             for mma_q in cutlass.range_constexpr(num_mma_q):
+                if const_expr(valid_rows is not None):
+                    key = row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+                    b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+                    b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+                    b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+                    b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
                     o_frag[mma_q, mma_d, 1],
@@ -2321,6 +2355,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
     upcast_stride_plane,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    valid_rows=None,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2376,6 +2411,12 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
                     v_offset_cur, mma_d // 2
                 )
             for mma_q in cutlass.range_constexpr(num_mma_q):
+                if const_expr(valid_rows is not None):
+                    key = row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+                    b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+                    b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+                    b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+                    b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
                     o_frag[mma_q, mma_d, 1],
@@ -2424,6 +2465,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
     wide_head_lane,
     wide_stage_idx,
     wide_fp8_plane: cutlass.Constexpr = False,
+    valid_rows=None,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2477,6 +2519,12 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
                 if const_expr(wide_fp8_plane)
                 else _advance_offset_by_column_128b_2(v_offset_cur, mma_d // 2)
             )
+        if const_expr(valid_rows is not None):
+            key = row_base + warp_kv_idx * 16 + (lane % 4) * 2
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d, 0],
             o_frag[0, mma_d, 1],
@@ -2517,6 +2565,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1_m16n16_b8(
     num_mma_d_vo,
     upcast_stride_plane,
     v_scale,
+    valid_rows=None,
 ):
     """Load exact FP8 decode PV fragments with SM120 byte ldmatrix."""
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2548,6 +2597,12 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1_m16n16_b8(
         b_f8_0, b_f8_1 = ldmatrix_m16n16x1_trans_b8(v_addr)
         b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_0)
         b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_1)
+        if const_expr(valid_rows is not None):
+            key = row_base + warp_kv_idx * 16 + (lane % 4) * 2
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d, 0],
             o_frag[0, mma_d, 1],
@@ -6624,6 +6679,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_plane,
                                 v_scale,
                                 mDebugU32,
+                                valid_rows=tile_tokens,
                             )
                         else:
                             v_stage_plane_offset = (
@@ -6667,6 +6723,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_plane,
                                 v_scale,
                                 mDebugU32,
+                                valid_rows=tile_tokens,
                             )
                     _exit_thread()
 
@@ -6752,6 +6809,7 @@ class PagedForwardKernel:
                                         num_mma_d_vo,
                                         tc_upcast_stride_plane,
                                         v_scale,
+                                        valid_rows=tile_tokens,
                                     )
                                 else:
                                     _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
@@ -6779,6 +6837,7 @@ class PagedForwardKernel:
                                         math_head_lane,
                                         consume_stage_idx,
                                         self.laguna_fp8_head_pair_wide_math,
+                                        valid_rows=tile_tokens,
                                     )
                             else:
                                 _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
@@ -6804,6 +6863,7 @@ class PagedForwardKernel:
                                     num_mma_d_vo,
                                     tc_upcast_stride_plane,
                                     v_scale,
+                                    valid_rows=tile_tokens,
                                 )
                         else:
                             _literal_pv_mma_into_ofrag_plane_fp8_raw(
@@ -6829,6 +6889,7 @@ class PagedForwardKernel:
                                 num_mma_d_vo,
                                 tc_upcast_stride_plane,
                                 v_scale,
+                                valid_rows=tile_tokens,
                             )
                     else:
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
@@ -6854,6 +6915,7 @@ class PagedForwardKernel:
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                 else:
                     v_stage_plane_offset = (
@@ -6897,6 +6959,7 @@ class PagedForwardKernel:
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                     else:
                         _literal_pv_mma_into_ofrag_plane_bf16_packed(
@@ -6932,6 +6995,7 @@ class PagedForwardKernel:
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
 
                 pipeline_v.consumer_release(v_consumer_state)
